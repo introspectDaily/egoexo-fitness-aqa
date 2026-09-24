@@ -136,6 +136,7 @@ def compute_pos_weight(samples, indices, clip: float = 20.0) -> float:
 def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtype_name: str = "auto") -> dict:
     model.eval()
     preds, targets, kp_logits, kp_labels, kp_masks, order, view_types = [], [], [], [], [], [], []
+    prob_s, prob_k = [], []
 
     for batch in loader:
         feat = batch["feat"].to(device, non_blocking=True)
@@ -147,6 +148,8 @@ def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtyp
             out = model(feat, action_id, view_id, kp_mask)
 
         preds.append(out.score.float().cpu().numpy())
+        prob_s.append(torch.sigmoid(out.score_logits.float()).cpu().numpy())
+        prob_k.append(torch.sigmoid(out.keypoint_logits.float()).cpu().numpy())
         kp_logits.append(out.keypoint_logits.float().cpu().numpy())
         targets.append(batch["score"].numpy())
         kp_labels.append(batch["keypoint"].numpy())
@@ -156,6 +159,8 @@ def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtyp
 
     pred = np.concatenate(preds)
     target = np.concatenate(targets)
+    prob_s = np.concatenate(prob_s)   # (N, K-1) 累积概率
+    prob_k = np.concatenate(prob_k)   # (N, n_kp)  逐关键点概率
     logits = np.concatenate(kp_logits)
     labels = np.concatenate(kp_labels)
     masks = np.concatenate(kp_masks)
@@ -177,7 +182,41 @@ def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtyp
             res[name]["keypoint@best"] = keypoint_metrics(logits[sel], labels[sel], masks[sel], thr)
 
     res["per_action"] = per_action_breakdown(samples, order, pred, target)
-    res["_raw"] = {"pred": pred, "target": target, "order": order, "view_types": view_types}
+
+    # 多视角融合：同一个物理动作有最多 6 路同步视角，标签完全相同。
+    # 逐视角预测再平均 = 白送的方差缩减，且是这个数据集独有的结构（别的 AQA 数据集没有多视角）。
+    # 注意：这是**推理期**融合，不改训练；论文只报单视角，所以我们两个都报。
+    fused = None
+    if len(order) > 0:
+        groups: dict[str, list[int]] = {}
+        for pos, gi in enumerate(order):
+            groups.setdefault(samples[gi].action_key, []).append(pos)
+        if any(len(v) > 1 for v in groups.values()):
+            keys = [k for k in groups if len(groups[k]) > 1]
+            order_f = np.array([groups[k][0] for k in keys])
+            # CORAL 要先在累积概率上平均，再算期望分；不能直接平均最终分数
+            ps = np.stack([prob_s[groups[k]].mean(0) for k in keys])
+            pred_f = 1.0 + ps.sum(-1)
+            pk = np.stack([prob_k[groups[k]].mean(0) for k in keys])
+            # 平均后的概率转回 logit，复用同一套阈值/指标代码
+            eps = 1e-6
+            lk = np.log(np.clip(pk, eps, 1 - eps)) - np.log(np.clip(1 - pk, eps, 1 - eps))
+            yk = np.stack([kp_labels[groups[k][0]] for k in keys])
+            mk = np.stack([kp_masks[groups[k][0]] for k in keys])
+            vt = np.array([view_types[groups[k][0]] for k in keys])
+            res["fused"] = {"n_actions": len(keys), "n_views_avg": float(np.mean([len(groups[k]) for k in keys]))}
+            for name, sel in (("overall", np.ones(len(keys), bool)), ("ego", vt == "ego"), ("exo", vt == "exo")):
+                if sel.sum() == 0: continue
+                res["fused"][name] = {
+                    "score": score_metrics(pred_f[sel], target[order_f][sel]),
+                    "keypoint@0.5": keypoint_metrics(lk[sel], yk[sel], mk[sel], 0.5),
+                }
+            thr2, f1b = best_threshold(lk, yk, mk)
+            res["fused"]["best_threshold"] = {"threshold": thr2, "f1": f1b}
+            fused = {"pred": pred_f, "lk": lk, "yk": yk, "mk": mk}
+
+    res["_raw"] = {"pred": pred, "target": target, "order": order, "view_types": view_types,
+                   "fused": fused}
     return res
 
 
@@ -196,6 +235,9 @@ def summarize(res: dict) -> dict[str, float]:
         "srocc_exo": res.get("exo", {}).get("score", {}).get("srocc", float("nan")),
         "kp_f1_ego": res.get("ego", {}).get("keypoint@0.5", {}).get("f1", float("nan")),
         "kp_f1_exo": res.get("exo", {}).get("keypoint@0.5", {}).get("f1", float("nan")),
+        "fused_srocc": res.get("fused", {}).get("overall", {}).get("score", {}).get("srocc", float("nan")),
+        "fused_kp_f1": res.get("fused", {}).get("overall", {}).get("keypoint@0.5", {}).get("f1", float("nan")),
+        "fused_kp_best": res.get("fused", {}).get("best_threshold", {}).get("f1", float("nan")),
     }
 
 
