@@ -205,8 +205,10 @@ def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtyp
             # 平均后的概率转回 logit，复用同一套阈值/指标代码
             eps = 1e-6
             lk = np.log(np.clip(pk, eps, 1 - eps)) - np.log(np.clip(1 - pk, eps, 1 - eps))
-            yk = np.stack([kp_labels[groups[k][0]] for k in keys])
-            mk = np.stack([kp_masks[groups[k][0]] for k in keys])
+            # 注意用拼接后的 labels/masks，不是收集用的 kp_labels/kp_masks 列表
+            # （踩过：索引 list 时传入全局样本下标，直接越界 IndexError）
+            yk = np.stack([labels[groups[k][0]] for k in keys])
+            mk = np.stack([masks[groups[k][0]] for k in keys])
             vt = np.array([view_types[groups[k][0]] for k in keys])
             res["fused"] = {"n_actions": len(keys), "n_views_avg": float(np.mean([len(groups[k]) for k in keys]))}
             for name, sel in (("overall", np.ones(len(keys), bool)), ("ego", vt == "ego"), ("exo", vt == "exo")):
