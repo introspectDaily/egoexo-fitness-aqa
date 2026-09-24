@@ -1,9 +1,6 @@
-# Colab 上 torch / torchvision 已预装，不要在这里钉版本，否则会触发重装（很慢且可能装错 CUDA 版本）
-numpy>=1.24
-pandas>=2.0
-scipy>=1.11
-scikit-learn>=1.3
-tqdm>=4.66
-transformers>=4.40
-huggingface_hub>=0.23
-tensorboard>=2.15
+# 只列代码真正 import 的第三方包（核对过 src/ 和 scripts/ 的全部 import）。
+# torch / torchvision 按机器的 CUDA 版本单独装，见 README 的安装段。
+numpy
+scipy
+transformers
+huggingface_hub

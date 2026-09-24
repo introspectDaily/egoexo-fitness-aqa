@@ -7,12 +7,11 @@ name = "egoexo"
 version = "0.1.0"
 description = "EgoExo-Fitness 微调：动作质量分(有序回归) + 可解释关键点验证(GEV)"
 requires-python = ">=3.9"
+# 只列代码真正 import 的包。torch 故意不在这里 —— 它要按机器上的 CUDA 单独装，
+# 由 requirements.txt / 安装脚本指定 index，避免 pyproject 把 torch 拖进默认源解析。
 dependencies = [
     "numpy>=1.24",
-    "pandas>=2.0",
     "scipy>=1.11",
-    "scikit-learn>=1.3",
-    "tqdm>=4.66",
     "transformers>=4.40",
     "huggingface_hub>=0.23",
 ]
