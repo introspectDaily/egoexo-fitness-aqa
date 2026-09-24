@@ -252,7 +252,7 @@ def train_fold(
         uids = action_uids[batch["index"].to(device)]
         return infonce_alignment(z, uids, batch["is_ego"].to(device))
 
-    best = {"score": -1.0, "state": None, "epoch": -1}
+    best = {"score": -float("inf"), "state": None, "epoch": -1}
     history = []
     t0 = time.time()
 
@@ -301,8 +301,13 @@ def train_fold(
         log(f"[fold {split.fold}] ep {epoch + 1:3d}/{cfg.epochs} loss={avg.get('total', float('nan')):.4f} "
             f"| val SROCC={s['srocc']:.4f} MAE={s['mae']:.4f} | KP F1={s['kp_f1']:.4f} (best {s['kp_f1_best']:.4f})")
 
-        # 用 SROCC 早停（AQA 领域主指标），而不是 loss
-        crit = s["srocc"] if not np.isnan(s["srocc"]) else -1.0
+        # 用 SROCC 早停（AQA 领域主指标），而不是 loss。
+        # 少数情况下 SROCC 会是 NaN —— :func:`metrics._safe_spearman` 在预测接近常数时
+        # 主动返回 NaN（此时秩相关无定义）。这时退回 -MAE，否则 best 会永远停在初始值，
+        # 最后 load_state_dict(None) 直接崩。
+        crit = s["srocc"]
+        if np.isnan(crit):
+            crit = -s["mae"]
         if crit > best["score"]:
             best = {"score": crit, "state": state_now, "epoch": epoch}
 

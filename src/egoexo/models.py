@@ -292,6 +292,10 @@ def infonce_alignment(
 
     logits = logits.masked_fill(eye, float("-inf"))
     log_prob = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    # ⚠️ 必须用 masked_fill 而不是 `log_prob * pos`：对角线位置的 log_prob 是 -inf，
+    #    而 `-inf * 0` 是 **NaN**（不是 0），会把整个 loss 污染成 NaN。
+    log_prob = log_prob.masked_fill(~pos, 0.0)
+
     pos_count = pos.sum(dim=-1).clamp(min=1)
-    loss = -(log_prob * pos).sum(dim=-1)[valid] / pos_count[valid]
+    loss = -log_prob.sum(dim=-1)[valid] / pos_count[valid]
     return loss.mean()
