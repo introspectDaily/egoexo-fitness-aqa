@@ -70,25 +70,45 @@ def discover(features_root: str | Path) -> dict[tuple[str, str], Path]:
 # ---------------------------------------------------------------- 张量归一化
 
 
+# .pth 里 tensor 常见 key 名。实测 EgoExo-Fitness 用的是 "clip_feat"，
+# 但同时保留其他候选，因为作者以后重新打包可能会换名。
+_FEAT_KEYS = (
+    "clip_feat",
+    "feat",
+    "feats",
+    "feature",
+    "features",
+    "video_features",
+    "frame_features",
+    "x",
+)
+
+
 def to_frame_matrix(obj, dim: int = CLIP_B32_DIM) -> np.ndarray:
     """把 .pth 里反序列化出来的任意东西规整成 (T, D) 的 float32 数组。
 
-    这些 .pth 是作者用 torch.save 随手存的，格式没有文档。所以这里做防御式解析：
-    依次尝试 dict 常见 key、tuple 取第一个、ndim==3 时对中间维求均值（空间 token）。
+    实测结构：`{"clip_feat": <tensor>, "view": "ego_l", "record": "08ALrC"}`
+    但这些 .pth 是作者用 torch.save 随手存的，格式无文档。所以做防御式解析：
+    先查常见 key，再回退到“取第一个 tensor/ndarray 值”，最后处理 ndim==3
+    （空间 token 时对 token 维求均值）。
     """
     import torch
 
     if isinstance(obj, dict):
-        for key in ("feat", "feats", "feature", "features", "video_features", "frame_features", "x"):
+        picked = None
+        for key in _FEAT_KEYS:
             if key in obj:
-                obj = obj[key]
+                picked = obj[key]
                 break
-        else:
-            # 只有一个 value 时就用它（作者可能用了自定义 key）
-            if len(obj) == 1:
-                obj = next(iter(obj.values()))
-            else:
-                raise ValueError(f"无法识别 .pth 的 dict 结构，keys={list(obj)[:10]}")
+        if picked is None:
+            # 未知 key：取第一个 tensor/ndarray 值（元信息如 'view'/'record' 是字符串，会被跳过）
+            for v in obj.values():
+                if torch.is_tensor(v) or isinstance(v, np.ndarray):
+                    picked = v
+                    break
+        if picked is None:
+            raise ValueError(f"无法从 .pth 的 dict 里找到特征张量，keys={list(obj)[:10]}")
+        obj = picked
 
     if isinstance(obj, (list, tuple)):
         obj = obj[0]
@@ -138,6 +158,10 @@ def probe(features_root: str | Path, max_files: int = 3) -> list[dict]:
             info["raw_type"] = type(obj).__name__
             if isinstance(obj, dict):
                 info["dict_keys"] = list(obj)[:10]
+                # 把 dict 里每个值的类型/形状也报出来 —— 万一 key 名变了，看这里就能定位
+                info["dict_values"] = {
+                    k: (tuple(v.shape) if hasattr(v, "shape") else repr(v)[:40]) for k, v in list(obj.items())[:10]
+                }
             if torch.is_tensor(obj):
                 info["raw_shape"] = tuple(obj.shape)
                 info["raw_dtype"] = str(obj.dtype)
@@ -145,6 +169,9 @@ def probe(features_root: str | Path, max_files: int = 3) -> list[dict]:
             info["frames"] = int(arr.shape[0])
             info["dim"] = int(arr.shape[1])
             info["frame_dim_ok"] = info["dim"] == CLIP_B32_DIM
+            info["feat_min"] = float(arr.min())
+            info["feat_max"] = float(arr.max())
+            info["feat_norm_mean"] = float(np.linalg.norm(arr, axis=-1).mean())
         except Exception as e:  # noqa: BLE001
             info["error"] = f"{type(e).__name__}: {e}"
         out.append(info)
