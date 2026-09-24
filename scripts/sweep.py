@@ -54,6 +54,12 @@ CONFIGS: dict[str, list[str]] = {
     "highdrop": ["--dropout", "0.4", "--feat-dropout", "0.2"],
     "long150": ["--epochs", "150"],
     "bigbatch": ["--batch-size", "256", "--lr", "8e-4"],
+
+    # --- 解耦分数/<wbr>关键点梯度。分数标签 alpha=0.17，关键点标签一致率 0.83；
+    #     默认让前者回流进后者表征，等于用脏水洗衣服 ---
+    "decouple": ["--kp-grad-scale", "0.0"],
+    "halfdecouple": ["--kp-grad-scale", "0.5"],
+    "noscorekp": ["--no-score-kp"],  # 对照：分数头完全看不到关键点（会丢可解释性）
 }
 
 METRIC_KEYS = ["srocc", "plcc", "mae", "acc1", "kp_f1", "kp_f1_best",

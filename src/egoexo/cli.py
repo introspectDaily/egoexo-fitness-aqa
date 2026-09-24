@@ -260,6 +260,7 @@ def cmd_train(args) -> None:
         dropout=args.dropout, dim=args.dim, depth=args.depth, heads=args.heads,
         temporal_jitter=args.temporal_jitter, feat_dropout=args.feat_dropout, score_noise=args.score_noise,
         focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=args.eval_train, use_worst_frame=not args.no_worst_frame,
+        kp_grad_scale=args.kp_grad_scale, use_kp_feats=not args.no_score_kp,
         seed=args.seed, num_workers=args.num_workers,
         amp=not args.no_amp, amp_dtype=args.amp_dtype,
         weights=LossWeights(score=args.w_score, keypoint=args.w_keypoint, action=args.w_action, align=args.w_align),
@@ -356,6 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--w-keypoint", type=float, default=1.0)
     s.add_argument("--w-action", type=float, default=0.3)
     s.add_argument("--w-align", type=float, default=0.7, help="跨视角 InfoNCE 权重，论文用 0.7")
+    s.add_argument("--kp-grad-scale", type=float, default=1.0,
+                   help="分数头->关键点头的梯度回流强度。1=全耦合(默认)，0=切断。"
+                        "分数标签 alpha 只有 0.17，关键点标签一致率 0.83，"
+                        "默认的全耦合等于让噪声任务去改可靠任务的表征。")
+    s.add_argument("--no-score-kp", action="store_true",
+                   help="分数头不吃关键点统计量，退化成纯视觉回归（会丢可解释性，只作为对照）")
     s.add_argument("--only-views", default=None)
     s.add_argument("--score-debias", action="store_true",
                    help="按标注者个人均值去偏（实测逐对完全相等率 31%%->40%%）。"

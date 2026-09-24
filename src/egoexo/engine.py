@@ -40,6 +40,10 @@ class TrainConfig:
     focal_gamma: float = 0.0
     ema_decay: float = 0.0  # >0 时启用 EMA 权重
     use_worst_frame: bool = True  # 关键点头是否带「最差帧」通道
+    # 分数头 -> 关键点头的梯度回流强度（1=全耦合，0=切断）。分数标签 alpha=0.17，
+    # 关键点标签一致率 0.83，让前者改后者表征是在用脏水洗衣服。
+    kp_grad_scale: float = 1.0
+    use_kp_feats: bool = True  # 分数头是否消费关键点统计量（关掉=纯视觉回归）
     eval_train: bool = False  # 每 epoch 额外算训练集指标，用于诊断过拟合/欠拟合
     seed: int = 0
     num_workers: int = 4
@@ -291,6 +295,7 @@ def train_fold(
         kp_text_emb=kp_text_emb,
         dim=cfg.dim, depth=cfg.depth, heads=cfg.heads, dropout=cfg.dropout,
         num_frames=bundle.num_frames, use_worst_frame=cfg.use_worst_frame,
+        kp_grad_scale=cfg.kp_grad_scale, use_kp_feats=cfg.use_kp_feats,
     ).to(device)
 
     pos_weight = torch.tensor(compute_pos_weight(samples, split.train_idx), device=device)

@@ -157,14 +157,36 @@ class ScoreHead(nn.Module):
 
     副作用：分数变成“关键点结论的函数”，天然可解释 —— 可以直接说
     “因为这两条没达标，所以判定 3 分”。
+
+    ⚠️ 但这个设计有个代价，实测暴露出来了：分数头的梯度会**回流进关键点头**。
+    分数标签噪声极大（alpha=0.17），而关键点标签可靠得多（一致率 83%）。
+    让一个 0.17 信噪比的任务去改一个 0.83 信噪比任务的表征，是在用脏水洗衣服。
+    实测关键点 F1 卡在 0.49 上不去（论文 0.5439），这就是嫌疑之一。
+
+    `kp_grad_scale` 控制这个回流强度（直通估计器，前向值不变、只改梯度）：
+      1.0  = 完全耦合（原行为）
+      0.5  = 半解耦
+      0.0  = 完全切断（分数头照旧读到关键点概率 -> 可解释性保留，但关键点头不被污染）
+    注意 0.0 和「不把关键点喂给分数头」是两件事：前者保留输入、只切梯度，
+    后者连输入都没了，可解释性也一起丢掉。
     """
 
     KP_FEAT_DIM = 5
 
-    def __init__(self, dim: int, levels: int = 5, dropout: float = 0.1, max_keypoints: int = 12):
+    def __init__(
+        self,
+        dim: int,
+        levels: int = 5,
+        dropout: float = 0.1,
+        max_keypoints: int = 12,
+        kp_grad_scale: float = 1.0,
+        use_kp_feats: bool = True,
+    ):
         super().__init__()
         self.coral = CoralHead(dim + self.KP_FEAT_DIM, levels, dropout)
         self.max_keypoints = max(1, max_keypoints)
+        self.kp_grad_scale = float(kp_grad_scale)
+        self.use_kp_feats = bool(use_kp_feats)
 
     def forward(
         self,
@@ -172,10 +194,13 @@ class ScoreHead(nn.Module):
         kp_logits: torch.Tensor | None = None,
         kp_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if kp_logits is None or kp_mask is None:
+        if kp_logits is None or kp_mask is None or not self.use_kp_feats:
             return self.coral(torch.cat([z, z.new_zeros(z.size(0), self.KP_FEAT_DIM)], dim=-1))
 
         p = torch.sigmoid(kp_logits) * kp_mask  # padding 位置归零
+        # 直通：前向用真实 p，反向按 scale 缩放（scale=0 就等于 detach）
+        if self.kp_grad_scale != 1.0:
+            p = p.detach() + self.kp_grad_scale * (p - p.detach())
         n = kp_mask.sum(dim=-1, keepdim=True).clamp(min=1)
         mean = p.sum(dim=-1, keepdim=True) / n
         satisfied = mean
@@ -291,6 +316,8 @@ class AqaModel(nn.Module):
         use_action_head: bool = True,
         use_view_embed: bool = True,
         use_worst_frame: bool = True,
+        kp_grad_scale: float = 1.0,
+        use_kp_feats: bool = True,
     ):
         super().__init__()
         self.encoder = TemporalEncoder(in_dim, dim, depth, heads, dropout, max_len=max(64, num_frames * 2))
@@ -300,7 +327,8 @@ class AqaModel(nn.Module):
             self.view_embed = nn.Embedding(6, dim)
             nn.init.normal_(self.view_embed.weight, std=0.02)
 
-        self.score_head = ScoreHead(dim, score_levels, dropout, max_keypoints=kp_text_emb.size(1))
+        self.score_head = ScoreHead(dim, score_levels, dropout, max_keypoints=kp_text_emb.size(1),
+                                    kp_grad_scale=kp_grad_scale, use_kp_feats=use_kp_feats)
         self.keypoint_head = KeypointHead(dim, kp_text_emb.size(-1), heads, dropout, use_worst_frame=use_worst_frame)
         self.use_action_head = use_action_head
         self.action_head = nn.Linear(dim, num_actions) if use_action_head else None
