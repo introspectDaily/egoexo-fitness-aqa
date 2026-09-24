@@ -256,7 +256,8 @@ def cmd_train(args) -> None:
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         dropout=args.dropout, dim=args.dim, depth=args.depth, heads=args.heads,
         temporal_jitter=args.temporal_jitter, feat_dropout=args.feat_dropout, score_noise=args.score_noise,
-        focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, seed=args.seed, num_workers=args.num_workers,
+        focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=not args.no_eval_train,
+        seed=args.seed, num_workers=args.num_workers,
         amp=not args.no_amp,
         weights=LossWeights(score=args.w_score, keypoint=args.w_keypoint, action=args.w_action, align=args.w_align),
     )
@@ -342,6 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--score-noise", type=float, default=0.15)
     s.add_argument("--focal-gamma", type=float, default=0.0)
     s.add_argument("--ema-decay", type=float, default=0.0)
+    s.add_argument("--no-eval-train", action="store_true",
+                   help="不每 epoch 评估训练集（省约 30%% 时间，但失去过拟合/欠拟合诊断）")
     s.add_argument("--w-score", type=float, default=1.0)
     s.add_argument("--w-keypoint", type=float, default=1.0)
     s.add_argument("--w-action", type=float, default=0.3)
