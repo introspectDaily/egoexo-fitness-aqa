@@ -1,0 +1,20 @@
+# 数据与产物：绝不入库
+data/
+runs/
+*.pth
+*.pt
+*.npy
+*.npz
+*.tar.gz*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 本地/编辑器
+.DS_Store
+.idea/
+.vscode/
