@@ -93,7 +93,7 @@ class TemporalEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=depth)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=depth, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(dim)
         self.dim = dim
 
@@ -125,7 +125,9 @@ class CoralHead(nn.Module):
         self.bias = nn.Parameter(torch.zeros(levels - 1))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.drop(z) @ self.weight + self.bias  # (B, K-1) 累积 logits
+        # z (B,D) @ weight (D,1) -> (B,1)，再广播加 bias (K-1,) -> (B,K-1)
+        # 共享权重 + 独立偏置：这是 CORAL 的定义，保证 K-1 个累积 logit 只差一个偏置
+        return self.drop(z) @ self.weight.unsqueeze(-1) + self.bias
 
     @staticmethod
     def predict(logits: torch.Tensor, score_min: int = 1) -> torch.Tensor:
