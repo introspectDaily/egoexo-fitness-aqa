@@ -37,6 +37,11 @@ def build_kp_text_table(
             print(f"[text] 命中缓存 {cache/'kp_text_emb.pt'}  shape={tuple(table.shape)}")
             return table
 
+    # 保险：即使调用方忘了设，这里也确保走镜像（国内网络必需）
+    from .secrets import apply_hf_endpoint
+
+    apply_hf_endpoint()
+
     from transformers import CLIPTextModelWithProjection, CLIPTokenizer
 
     print(f"[text] 加载 {model_name} 的文本编码器（首次运行需下载 ~600MB）")

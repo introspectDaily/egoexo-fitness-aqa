@@ -123,13 +123,27 @@ def apply_hf_endpoint(default: str | None = None, quiet: bool = True) -> str | N
 
     优先级：已有的 HF_ENDPOINT 环境变量 > ~/.hf_env 里的 HF_ENDPOINT > default。
     """
-    if os.environ.get("HF_ENDPOINT"):
-        return os.environ["HF_ENDPOINT"]
-    value = dotenv_all(quiet=quiet).get("HF_ENDPOINT") or default
-    if value:
-        os.environ["HF_ENDPOINT"] = value
-        if not quiet:
-            print(f"[secrets] HF_ENDPOINT -> {value}")
+    value = os.environ.get("HF_ENDPOINT") or dotenv_all(quiet=quiet).get("HF_ENDPOINT") or default
+    if not value:
+        return None
+    os.environ["HF_ENDPOINT"] = value
+
+    # ⚠️ 光设环境变量不够。huggingface_hub 的 ENDPOINT 是**模块导入时**求值的常量
+    #     （huggingface_hub/constants.py: ENDPOINT = os.getenv("HF_ENDPOINT", "https://huggingface.co")），
+    #     如果它已经被 import 过，再改 os.environ 对它没有任何影响，请求照样打到
+    #     huggingface.co，然后报 "Network is unreachable" 这种误导性错误。
+    #     所以这里在模块已加载时同步改掉那个常量。没加载就不用管，import 时会读到 env。
+    try:
+        import sys as _sys
+
+        mod = _sys.modules.get("huggingface_hub.constants")
+        if mod is not None:
+            mod.ENDPOINT = value
+    except Exception:  # noqa: BLE001  改库内部常量属于尽力而为，失败不阻断
+        pass
+
+    if not quiet:
+        print(f"[secrets] HF_ENDPOINT -> {value}")
     return value
 
 

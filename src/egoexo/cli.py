@@ -371,6 +371,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # 必须在任何子命令之前：HF_ENDPOINT 决定了 huggingface.co 还是 hf-mirror.com。
+    # 放在这里而不是各子命令里，是为了不依赖"记得加"——text.py 拉 CLIP 文本塔时
+    # 也要走镜像，漏一处就是一次 Network is unreachable。
+    from .secrets import apply_hf_endpoint
+
+    apply_hf_endpoint()
+
     args = build_parser().parse_args()
     args.func(args)
 
