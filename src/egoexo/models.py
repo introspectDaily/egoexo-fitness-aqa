@@ -290,6 +290,7 @@ class AqaModel(nn.Module):
         score_levels: int = 5,
         use_action_head: bool = True,
         use_view_embed: bool = True,
+        use_worst_frame: bool = True,
     ):
         super().__init__()
         self.encoder = TemporalEncoder(in_dim, dim, depth, heads, dropout, max_len=max(64, num_frames * 2))
@@ -300,7 +301,7 @@ class AqaModel(nn.Module):
             nn.init.normal_(self.view_embed.weight, std=0.02)
 
         self.score_head = ScoreHead(dim, score_levels, dropout, max_keypoints=kp_text_emb.size(1))
-        self.keypoint_head = KeypointHead(dim, kp_text_emb.size(-1), heads, dropout)
+        self.keypoint_head = KeypointHead(dim, kp_text_emb.size(-1), heads, dropout, use_worst_frame=use_worst_frame)
         self.use_action_head = use_action_head
         self.action_head = nn.Linear(dim, num_actions) if use_action_head else None
 

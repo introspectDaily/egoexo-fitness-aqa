@@ -39,9 +39,10 @@ class TrainConfig:
     score_noise: float = 0.15
     focal_gamma: float = 0.0
     ema_decay: float = 0.0  # >0 时启用 EMA 权重
-    eval_train: bool = True  # 每 epoch 额外算训练集指标，用于诊断过拟合/欠拟合
+    use_worst_frame: bool = True  # 关键点头是否带「最差帧」通道
+    eval_train: bool = False  # 每 epoch 额外算训练集指标，用于诊断过拟合/欠拟合
     seed: int = 0
-    num_workers: int = 2
+    num_workers: int = 4
     device: str = "cuda"
     amp: bool = True
     weights: LossWeights = field(default_factory=LossWeights)
@@ -227,7 +228,7 @@ def train_fold(
         num_actions=len(bundle.action_to_id),
         kp_text_emb=kp_text_emb,
         dim=cfg.dim, depth=cfg.depth, heads=cfg.heads, dropout=cfg.dropout,
-        num_frames=bundle.num_frames,
+        num_frames=bundle.num_frames, use_worst_frame=cfg.use_worst_frame,
     ).to(device)
 
     pos_weight = torch.tensor(compute_pos_weight(samples, split.train_idx), device=device)

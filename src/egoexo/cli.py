@@ -251,12 +251,15 @@ def cmd_train(args) -> None:
     kp_text = build_kp_text_table(vocab, bundle.action_to_id, out_dir=args.cache_dir)
 
     folds = group_kfold(samples, n_splits=args.folds, seed=args.seed) if args.folds > 1 else [holdout(samples, seed=args.seed)]
+    if args.fold is not None:
+        folds = [folds[args.fold]]
+        print(f"[train] 只跑 fold {args.fold}/{args.folds}（并行扫参用）")
 
     cfg = TrainConfig(
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         dropout=args.dropout, dim=args.dim, depth=args.depth, heads=args.heads,
         temporal_jitter=args.temporal_jitter, feat_dropout=args.feat_dropout, score_noise=args.score_noise,
-        focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=not args.no_eval_train,
+        focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=args.eval_train, use_worst_frame=not args.no_worst_frame,
         seed=args.seed, num_workers=args.num_workers,
         amp=not args.no_amp,
         weights=LossWeights(score=args.w_score, keypoint=args.w_keypoint, action=args.w_action, align=args.w_align),
@@ -330,6 +333,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--cache-dir", default="data/cache")
     s.add_argument("--out", default="runs/exp1")
     s.add_argument("--folds", type=int, default=5)
+    s.add_argument("--fold", type=int, default=None,
+                   help="只跑第 N 折（N 从 0 开始）。用于按折并行的扫参，同一 --folds 下不同 --fold 的验证集互补")
     s.add_argument("--epochs", type=int, default=40)
     s.add_argument("--batch-size", type=int, default=32)
     s.add_argument("--lr", type=float, default=3e-4)
@@ -343,8 +348,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--score-noise", type=float, default=0.15)
     s.add_argument("--focal-gamma", type=float, default=0.0)
     s.add_argument("--ema-decay", type=float, default=0.0)
-    s.add_argument("--no-eval-train", action="store_true",
-                   help="不每 epoch 评估训练集（省约 30%% 时间，但失去过拟合/欠拟合诊断）")
+    s.add_argument("--no-worst-frame", action="store_true",
+                   help="关掉关键点头的「最差帧」通道（消融用）")
+    s.add_argument("--eval-train", action="store_true",
+                   help="每 epoch 额外评估训练集（慢约一倍，但能区分过拟合/欠拟合）")
     s.add_argument("--w-score", type=float, default=1.0)
     s.add_argument("--w-keypoint", type=float, default=1.0)
     s.add_argument("--w-action", type=float, default=0.3)
@@ -354,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="按标注者个人均值去偏（实测逐对完全相等率 31%%->40%%）。"
                         "标签在训练时现算，所以只在这里设就够了")
     s.add_argument("--seed", type=int, default=0)
-    s.add_argument("--num-workers", type=int, default=2)
+    s.add_argument("--num-workers", type=int, default=4)
     s.add_argument("--no-amp", action="store_true")
     s.set_defaults(func=cmd_train)
 

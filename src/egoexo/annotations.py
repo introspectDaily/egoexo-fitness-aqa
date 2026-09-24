@@ -17,7 +17,13 @@ interpretable_action_judgement.json   ← 本任务的主标注
                                                 action_quality_score: 1..5,
                                                 comment, action_name, action_guidance, annotator}, ... ],
                                 st_ed_frame: [st, ed], frame_root: "frames_open/<rid>"}}
-    ⚠️ k 是 **1-based**，对应 action_info[k-1]；实测 st_ed_frame 与 action_info 完全一致。
+    ⚠️ k 的语义（913 条 IAJ 全量实测，别再用论文/注释里的说法）：
+       `action_info` 每行是 `[class_id, st, ed]`，**第一列是类别 id，不是下标**。
+       IAJ key 里的 k 是 action_info 的 **0-based 下标**（每个 record 都从 0 开始且连续）。
+       st_ed_frame 与 action_info[k]：832 条完全相等，59 条是相邻同动作被合并成一个窗口，
+       22 条是边界被标注者微调，**0 条**与 action_info[k-1] 对齐。
+       旧注释写的 “k 是 1-based、对应 action_info[k-1]” 是错的，
+       因为当时可能只有 st_ed_frame 路径跑通而没核对 fallback。
 
 subaction_level_annotations_ant13_style_v1.json
     ActivityNet 风格，key = "{actor}_{seq}-{x}-{y}_{view}"，带 subset: train|test。
@@ -234,14 +240,15 @@ def load_actions(raw_dir: Path, records: dict[str, Record]) -> dict[str, Action]
             skipped["no_annotations"] += 1
             continue
 
-        # st_ed_frame 优先；缺失时回落到 action_level（实测两者一致）
+        # st_ed_frame 优先（实测 913 条**全部**自带，下面这条 fallback 目前永远不会触发，
+        # 但保留正确的 0-based 写法，避免以后作者重打包数据时静默拿错动作窗口）
         st, ed = entry.get("st_ed_frame") or (None, None)
         if st is None:
             info = al[rid]["action_info"]
-            if not (1 <= k <= len(info)):
+            if not (0 <= k < len(info)):
                 skipped["bad_key"] += 1
                 continue
-            _, st, ed = info[k - 1]
+            _, st, ed = info[k]
 
         # 关键点文本以第一位标注者为准（文本一致，只是 True/False 不同）
         kp_texts = [t for t, _ in anns[0]["key_point_verification"]]

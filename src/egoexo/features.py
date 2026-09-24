@@ -226,11 +226,23 @@ class FeatureBundle:
         return out_dir
 
     @classmethod
-    def load(cls, out_dir: str | Path) -> "FeatureBundle":
+    def load(cls, out_dir: str | Path, ram_threshold_gb: float = 2.0) -> "FeatureBundle":
+        """加载预抽取结果。
+
+        小于 ram_threshold_gb 时**直接读进内存**而不是 mmap。全量只有 176MB(fp16/32帧)，
+        而 mmap 会让每个样本的读取都走一遍页缓存/磁盘路径 —— 实测 GPU 利用率只有 15%，
+        瓶颈就在这类开销上，不在算力。
+        """
         out_dir = Path(out_dir)
         with open(out_dir / "manifest.json", "r", encoding="utf-8") as f:
             man = json.load(f)
-        arr = np.load(out_dir / "features.npy", mmap_mode="r")
+        size_gb = (out_dir / "features.npy").stat().st_size / 1e9
+        if size_gb <= ram_threshold_gb:
+            arr = np.load(out_dir / "features.npy")
+            print(f"[features] 已载入内存: {size_gb:.2f}GB ({arr.shape})")
+        else:
+            arr = np.load(out_dir / "features.npy", mmap_mode="r")
+            print(f"[features] 使用 mmap: {size_gb:.2f}GB ({arr.shape})")
         ids = man["sample_ids"]
         return cls(array=arr, sample_ids=ids, index={s: i for i, s in enumerate(ids)})
 
