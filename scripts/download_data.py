@@ -137,9 +137,11 @@ def main() -> None:
 
     # 先把凭证链走通，后面的报错才不会含糊
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from egoexo.secrets import describe, hf_login, mask
+    from egoexo.secrets import apply_hf_endpoint, describe, hf_login
 
-    print("[auth] 凭证状态:", describe())
+    ep = apply_hf_endpoint()
+    print(f"[auth] 凭证状态: {describe()}")
+    print(f"[auth] HF_ENDPOINT: {ep or '<默认 huggingface.co>（国内网络会连不上）'}")
     token = hf_login(quiet=False)
     if token is None:
         print("[auth] ⚠️ 未找到 HF token，只能下公开文件；gated 文件会 401")

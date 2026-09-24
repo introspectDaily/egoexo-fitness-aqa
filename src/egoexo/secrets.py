@@ -82,22 +82,20 @@ def _from_colab(name: str) -> str | None:
 DOTENV_PATH = Path.home() / ".hf_env"
 
 
-def _from_dotenv(name: str) -> tuple[str | None, str]:
-    """从 ~/.hf_env 读。只接受 `export KEY=VALUE` / `KEY=VALUE` 行。
-
-    权限检查：文件必须只有属主可读写（0o600）。Colab VM 虽然是一次性的，
-    但一个全局可读的凭证文件等于没设防，直接拒读并提示修法。
-    """
+def dotenv_all(quiet: bool = False) -> dict[str, str]:
+    """读 ~/.hf_env 的全部键值。权限不对时拒读（返回空 dict）。"""
+    out: dict[str, str] = {}
     if not DOTENV_PATH.exists():
-        return None, "missing"
+        return out
     try:
         mode = DOTENV_PATH.stat().st_mode & 0o777
         if mode & 0o077:
-            print(
-                f"[secrets] ⚠️ {DOTENV_PATH} 权限是 {oct(mode)}，应为 0o600，拒绝读取。\n"
-                f"            修: chmod 600 {DOTENV_PATH}"
-            )
-            return None, "insecure-perm"
+            if not quiet:
+                print(
+                    f"[secrets] ⚠️ {DOTENV_PATH} 权限是 {oct(mode)}，应为 0o600，拒绝读取。\n"
+                    f"            修: chmod 600 {DOTENV_PATH}"
+                )
+            return out
         for raw in DOTENV_PATH.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -105,13 +103,44 @@ def _from_dotenv(name: str) -> tuple[str | None, str]:
             if line.startswith("export "):
                 line = line[len("export ") :].strip()
             key, _, value = line.partition("=")
-            if key.strip() == name:
-                value = value.strip().strip('"').strip("'")
-                if value:
-                    return value, "ok"
+            value = value.strip().strip('"').strip("'")
+            if key.strip() and value:
+                out[key.strip()] = value
     except OSError:
-        return None, "unreadable"
-    return None, "not-found"
+        return out
+    return out
+
+
+def apply_hf_endpoint(default: str | None = None, quiet: bool = True) -> str | None:
+    """把 HF_ENDPOINT 应用到 os.environ。
+
+    为什么必须有这个：huggingface.co 在国内网络不可达（实测 curl 直接失败），
+    必须走 hf-mirror.com。huggingface_hub 只认 HF_ENDPOINT 环境变量，
+    所以要在**任何** HF 调用之前设好，否则报的是 DNS/连接超时这类误导性错误。
+
+    实测：hf-mirror.com **能代理 gated 数据集** —— 带 token 时
+    API 返回 200，resolve 小文件也返回 200 且内容正确。所以国内环境不需要额外方案。
+
+    优先级：已有的 HF_ENDPOINT 环境变量 > ~/.hf_env 里的 HF_ENDPOINT > default。
+    """
+    if os.environ.get("HF_ENDPOINT"):
+        return os.environ["HF_ENDPOINT"]
+    value = dotenv_all(quiet=quiet).get("HF_ENDPOINT") or default
+    if value:
+        os.environ["HF_ENDPOINT"] = value
+        if not quiet:
+            print(f"[secrets] HF_ENDPOINT -> {value}")
+    return value
+
+
+def _from_dotenv(name: str) -> tuple[str | None, str]:
+    """从 ~/.hf_env 读单个凭证。返回值 + 原因（用于报错提示）。"""
+    if not DOTENV_PATH.exists():
+        return None, "missing"
+    d = dotenv_all(quiet=False)
+    if not d:
+        return None, "unreadable-or-insecure"
+    return (d[name], "ok") if name in d else (None, "not-found")
 
 
 def get_secret(name: str, required: bool = True) -> str | None:
@@ -158,6 +187,7 @@ def hf_login(quiet: bool = True) -> str | None:
     用 login() 而不是设 HF_TOKEN：login() 写到 ~/.cache/huggingface/token，
     后续 huggingface_hub / hf_transfer 的下载都会自动带上，且不出现在进程环境里。
     """
+    apply_hf_endpoint()  # 必须在任何 HF 调用之前
     token = get_secret("HUGGINFACE_ACCESS_KEY_COLAB_CLI", required=False)
     if not token:
         return None

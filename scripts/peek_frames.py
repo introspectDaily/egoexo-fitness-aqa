@@ -37,6 +37,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+from PIL import Image
+
 REPO_ID = "Lymann/EgoExo-Fitness"
 FRAMES_TAR = "frames_open/frames_open.tar.gz.aa"
 FEAT_TAR = "features_open/visual/EgoExo_Fitness_CLIP_Vid_Feat_w_Rotate.tar.gz.aa"
@@ -94,10 +96,21 @@ class BudgetReader(io.RawIOBase):
         return n
 
 
+def endpoint() -> str:
+    """默认 huggingface.co；国内网络设 HF_ENDPOINT=https://hf-mirror.com 即可。
+
+    hf-mirror 会转发 Authorization 头，所以 gated 仓库照样能过（已实测 200）。
+    huggingface_hub / hf_hub_download 也认同一个环境变量。
+    """
+    import os
+
+    return (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+
+
 def open_stream(path_in_repo: str, token: str | None, budget_mb: int, what: str):
     import requests
 
-    url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/{path_in_repo}"
+    url = f"{endpoint()}/datasets/{REPO_ID}/resolve/main/{path_in_repo}"
     headers = {"Accept-Encoding": "identity"}  # 关键：别让 CDN 对 .gz 再套一层 gzip
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -179,14 +192,16 @@ def resolve_frame_idx(rid: str, spec: str, views: list[str], records, windows) -
         print(f"[peek] {rid} 没有 action_level 标注，退回取中段帧 {nf // 2}")
         return [nf // 2]
 
-    with_iaj = [r for r in rows if r[4]] or rows
-    # 选时长中位的那条：避开被裁短的第一个动作和异常长的动作
-    with_iaj.sort(key=lambda r: r[2] - r[1])
-    k, st, ed, name, has_iaj = with_iaj[len(with_iaj) // 2]
+    # 选**最早的一个「像样的」动作**：既保证帧号一定在动作内部，
+    # 又让 tar 流只需要前进一点点 —— 这是"看一眼"最省的选法。
+    # 太短（<3s）的可能只是被切碎的一段，跳过。
+    ok = [r for r in rows if r[2] - r[1] >= 3 * FPS] or rows
+    ok.sort(key=lambda r: r[1])
+    k, st, ed, name, has_iaj = ok[0]
     mid = (st + ed) // 2
     print(
-        f"[peek] auto 选中 action_{k}（= action_info[{k}]，0-based）[{name}] st_ed=[{st},{ed}] "
-        f"长度 {ed - st + 1} 帧（{(ed - st + 1) / FPS:.1f}s）"
+        f"[peek] auto 选中最早的像样动作 action_{k}（= action_info[{k}]，0-based）[{name}] "
+        f"st_ed=[{st},{ed}] 长 {ed - st + 1} 帧（{(ed - st + 1) / FPS:.1f}s）"
         f"{'，有 IAJ 标注' if has_iaj else '，无 IAJ（只看画面，没有关键点）'}"
     )
     return [mid]
@@ -261,17 +276,20 @@ def fetch_frames(token, record, spec, views, strip, budget_mb, records, windows)
                         flush=True,
                     )
 
-                if fid in want:
+                # ⚠️ 一个 member 只能 extractfile 一次：tar 是流，extractfile 之后再取
+                # 同一个 member 会 seek 回退，直接 StreamError('seeking backwards is not allowed')。
+                need_want = fid in want and view not in got.get(fid, {})
+                need_strip = strip > 0 and view == strip_view and max(want) <= fid < strip_hi
+                if need_want or need_strip:
                     f = tar.extractfile(m)
-                    if f is not None:
-                        got.setdefault(fid, {})[view] = f.read()
-                elif fid > max(want):
-                    passed.add(view)  # 这个视角的目录已经翻过目标帧了
-
-                if strip > 0 and view == strip_view and max(want) <= fid < strip_hi:
-                    f = tar.extractfile(m)
-                    if f is not None:
-                        strip_buf.append((fid, f.read()))
+                    data = f.read() if f is not None else None
+                    if data is not None:
+                        if need_want:
+                            got.setdefault(fid, {})[view] = data
+                        if need_strip:
+                            strip_buf.append((fid, data))
+                if fid > max(want):
+                    passed.add(view)  # 这个视角的目录已翻过目标帧
 
                 # 该视角要么已抓齐全部目标帧，要么已经翻过目标帧号（目录里没有 / 视角缺失）
                 views_done = all(
@@ -336,8 +354,6 @@ def annotation_context(raw_dir: Path, rid: str, fids: list[int]) -> None:
 
 
 def render(rid, got, views, out_dir: Path, rotate: bool):
-    from PIL import Image
-
     out_dir.mkdir(parents=True, exist_ok=True)
     fids = sorted(got)
     saved: list[Path] = []
@@ -361,29 +377,55 @@ def render(rid, got, views, out_dir: Path, rotate: bool):
     return pil_rows, saved
 
 
-def montage(pil_rows, out_png: Path, title: str, cols: int = 6):
-    import matplotlib
+def montage(pil_rows, out_png: Path, title: str, cols: int = 6, cell_w: int = 456):
+    """拼成一张总览图：行 = 视角，列 = 帧号。**只用 PIL**，不依赖 matplotlib。
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    训练环境（尤其国内新机器）少一个依赖就少一次下载失败的可能。
+    """
+    from PIL import ImageDraw, ImageFont
 
     n_r = len(pil_rows)
-    n_c = min(max(len(r) for _, r in pil_rows), cols)
-    if not n_r or not n_c:
+    if not n_r:
         return None
-    fig, axes = plt.subplots(n_r, n_c, figsize=(2.3 * n_c, 1.5 * n_r), squeeze=False)
-    for i, (view, row) in enumerate(pil_rows):
-        for j in range(n_c):
-            ax = axes[i][j]
-            ax.axis("off")
-            if j < len(row):
-                fid, im = row[j]
-                ax.imshow(im)
-                ax.set_title(f"{view}  #{fid}  {im.size[0]}×{im.size[1]}  {fid / FPS:.1f}s", fontsize=7)
-    fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=110)
-    plt.close(fig)
+    n_c = min(max(len(r) for _, r in pil_rows), cols)
+    if not n_c:
+        return None
+
+    try:  # Pillow >= 10.1 的 load_default 支持 size，否则退回内置小字体
+        font = ImageFont.load_default(size=15)
+        font_title = ImageFont.load_default(size=19)
+    except TypeError:
+        font = font_title = ImageFont.load_default()
+
+    gap, bar, head = 6, 20, 34
+    cell_h = 0
+    scaled = []
+    for view, row in pil_rows:
+        out_row = []
+        for fid, im in row[:n_c]:
+            w, h = im.size
+            nh = max(1, round(h * cell_w / w))
+            out_row.append((fid, im.resize((cell_w, nh), Image.LANCZOS)))
+            cell_h = max(cell_h, nh)
+        scaled.append((view, out_row))
+
+    W = cols * cell_w + (cols + 1) * gap
+    H = head + n_r * (bar + cell_h + gap) + 32
+    canvas = Image.new("RGB", (W, H), (24, 24, 28))
+    d = ImageDraw.Draw(canvas)
+    d.text((gap, 8), title, fill=(240, 240, 240), font=font_title)
+
+    for i, (view, row) in enumerate(scaled):
+        y = head + i * (bar + cell_h + gap)
+        for j in range(cols):
+            x = gap + j * (cell_w + gap)
+            if j >= len(row):
+                continue
+            fid, im = row[j]
+            canvas.paste(im, (x, y + bar))
+            d.text((x + 2, y + 1), f"{view}  #{fid}  {im.size[0]}x{im.size[1]}  {fid / FPS:.2f}s",
+                   fill=(180, 230, 180), font=font)
+    canvas.save(out_png)
     return out_png
 
 
@@ -401,19 +443,68 @@ def make_gif(pil_rows, out_gif: Path):
 # ---------------------------------------------------------------- CLIP 校验
 
 
-def verify_clip(token, rid: str, view: str, fids: list[int], out_dir: Path, budget_mb: int):
+def load_clip_encoder(device):
+    """优先 openai/clip（与官方抽特征脚本同一份代码）；没有就用 transformers 的同一权重。
+
+    Colab 预装了 transformers，所以这条 fallback 通常不用额外装任何东西。
+    两者共享同一个 512 维图像嵌入空间，同一张图的余弦相似度应 ≈ 1。
+    """
     import torch
 
     try:
         import clip  # openai/clip
-    except ImportError:
-        print("[peek] --verify-clip 需要官方 CLIP：\n"
-              "       !pip -q install git+https://github.com/openai/CLIP.git ftfy regex")
-        return
-    from PIL import Image
 
+        model, preprocess = clip.load("ViT-B/32", device=device)
+
+        def encode(im):
+            with torch.no_grad():
+                x = preprocess(im).unsqueeze(0).to(device)
+                return model.encode_image(x).float().cpu().squeeze(0)
+
+        return encode, "openai/clip ViT-B/32（与官方脚本完全一致）"
+    except ImportError:
+        pass
+
+    from transformers import CLIPImageProcessor, CLIPModel  # Colab 预装
+
+    name = "openai/clip-vit-base-patch32"
+    model = CLIPModel.from_pretrained(name).to(device).eval()
+    proc = CLIPImageProcessor.from_pretrained(name)
+
+    def encode(im):
+        px = proc(images=im, return_tensors="pt").pixel_values.to(device)
+        with torch.no_grad():
+            return model.get_image_features(pixel_values=px).float().cpu().squeeze(0)
+
+    return encode, f"transformers {name}（HF 转换版，同一权重）"
+
+
+def _torch_load(obj):
+    import torch
+
+    try:
+        return torch.load(obj, map_location="cpu", weights_only=False)
+    except TypeError:  # torch < 2.0 没有 weights_only
+        return torch.load(obj, map_location="cpu")
+
+
+def load_feat_tensor(feat_root: Path, rid: str, view: str, token, budget_mb: int):
+    """先找**本地已解压**的特征（服务器上一般已经有了），找不到才流式从 HF 取。
+
+    服务器上 data/features_open/ 通常是现成的 —— 这种情况下校验是零下载成本。
+    """
+    name = "clip_vit_b32_vid_frame_feat.pth"
+    local = feat_root / rid / view / name
+    if not local.exists():
+        hits = sorted(feat_root.rglob(f"{rid}/{view}/{name}"))
+        local = hits[0] if hits else None
+    if local is not None and local.exists():
+        print(f"[peek] 本地已有特征: {local}（{local.stat().st_size / 1e6:.1f}MB，不用下载）")
+        return _torch_load(local)
+
+    print(f"[peek] 本地 {feat_root} 里没有 {rid}/{view}，改为流式取")
     reader, resp = open_stream(FEAT_TAR, token, budget_mb, "features_open 分片 .aa")
-    feat = None
+    data = None
     try:
         with tarfile.open(fileobj=reader, mode="r|gz") as tar:
             for m in tar:
@@ -425,23 +516,31 @@ def verify_clip(token, rid: str, view: str, fids: list[int], out_dir: Path, budg
                 f = tar.extractfile(m)
                 if f is None:
                     continue
-                feat = torch.load(io.BytesIO(f.read()), map_location="cpu", weights_only=False)
                 print(f"[peek] 拿到 {rid}/{view} 特征: {m.name}（已用 {reader.n / 1e6:.1f}MB）")
+                data = f.read()
                 break
     finally:
         resp.close()
+    return _torch_load(io.BytesIO(data)) if data is not None else None
 
+
+def verify_clip(token, rid: str, view: str, fids: list[int], out_dir: Path, budget_mb: int,
+                feat_root: Path):
+    """现算一帧的特征，与 .pth 里的行比余弦相似度 —— 把 0/1-based 定死。"""
+    import torch
+
+    feat = load_feat_tensor(feat_root, rid, view, token, budget_mb)
     if feat is None:
-        print(f"[peek] 特征包里没找到 {rid}/{view}（可能 tar 顺序导致它在很靠后），跳过校验")
+        print(f"[peek] 没拿到 {rid}/{view} 的特征，跳过校验")
         return
-    t = feat["clip_feat"] if isinstance(feat, dict) else feat
-    print(f"[peek] clip_feat.shape = {tuple(t.shape)}  dtype={t.dtype}  "
-          f"（T 应等于该视角总帧数）")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load("ViT-B/32", device=device)
+    t = feat["clip_feat"] if isinstance(feat, dict) else feat
+    print(f"[peek] clip_feat.shape = {tuple(t.shape)}  dtype={t.dtype}  （T 应等于该视角总帧数）")
+
+    # 故意用 CPU：只有 1~2 张图，却能在**你的训练正占着 GPU** 时不碰显存、不抢算力
+    encode, which = load_clip_encoder("cpu")
     deg = OFFICIAL_ROTATE.get(view, 0)
-    print(f"[peek] 按官方口径（rotate {deg}°）现算特征，与 .pth 的行比余弦相似度：")
+    print(f"[peek] 用 {which}；按官方口径 rotate {deg}° 现算，与 .pth 的行比余弦相似度：")
     for fid in fids:
         p = out_dir / f"{view}_frame_{fid:010d}.jpg"
         if not p.exists():
@@ -451,8 +550,7 @@ def verify_clip(token, rid: str, view: str, fids: list[int], out_dir: Path, budg
                 return
             p = cand[0]
         im = Image.open(p).convert("RGB").rotate(deg, expand=True)
-        with torch.no_grad():
-            v = model.encode_image(preprocess(im).unsqueeze(0).to(device)).float().cpu().squeeze(0)
+        v = encode(im)
         sims = []
         for j in (fid - 1, fid, fid + 1):
             if 0 <= j < t.shape[0]:
@@ -475,6 +573,8 @@ def main() -> None:
     ap.add_argument("--rotate", action="store_true", help="额外输出按官方 rotate_dict 旋转后的图")
     ap.add_argument("--verify-clip", action="store_true", help="现算 CLIP 特征校验行号↔帧号")
     ap.add_argument("--raw-dir", default="data/raw_annotations")
+    ap.add_argument("--feat-root", default="data/features_open",
+                    help="本地已解压的特征根目录；--verify-clip 优先读它，不用下载")
     ap.add_argument("--budget-mb", type=int, default=800)
     ap.add_argument("--dry-run", action="store_true", help="不联网，只打标注上下文与计划")
     args = ap.parse_args()
@@ -507,8 +607,6 @@ def main() -> None:
     fids = sorted(got)
     print(f"[peek] 取到 record={rid}，帧号 {fids}")
 
-    from PIL import Image
-
     for v in target_views:
         for f in fids:
             if v in got[f]:
@@ -539,7 +637,8 @@ def main() -> None:
 
     if args.verify_clip:
         print()
-        verify_clip(token, rid, target_views[0], fids[:1], out_dir, args.budget_mb)
+        verify_clip(token, rid, target_views[0], fids[:1], out_dir, args.budget_mb,
+                    Path(args.feat_root))
 
     print(
         "\n[peek] 看图时确认这四件事：\n"
