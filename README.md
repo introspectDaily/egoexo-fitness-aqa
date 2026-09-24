@@ -295,6 +295,108 @@ colab/
 
 ---
 
+## 附二：局域网 3080 机器 + 国内网络（另一套可用环境）
+
+在 RTX 3080 20G / 32 核 / 国内网络上跑通的那套配置。和 Colab 的差异主要是三处：
+**走 hf-mirror、复用 uv 缓存的 torch、用 bf16 而不是 fp16**。
+
+### 1. 关键环境事实（实测）
+
+| 项 | 值 |
+|---|---|
+| GPU | RTX 3080 20480 MiB，compute cap **8.6**（Ampere）|
+| bf16 | **支持**（`torch.cuda.is_bf16_supported() == True`）|
+| uv | 0.11.17，缓存 44GB，其中 `archive-v0` 37GB |
+| ComfyUI venv | `/home/doit/.venv/comfyui`，Python 3.11.15，`torch 2.12.0+cu130` |
+| `github.com` | **不可达** |
+| `codeload.github.com` | 可达（要拉代码走 tarball，或直接局域网 rsync）|
+| `huggingface.co` | **不可达** |
+| `hf-mirror.com` | 可达，且**能代理 gated 数据集**（带 token 时 API 200、resolve 200）|
+| `download.pytorch.org` | 可达 |
+| `pypi.org` | 不可达；用 `mirrors.aliyun.com` |
+
+### 2. 建环境：同 Python/torch 版本，让 uv 命中缓存
+
+**要点：Python 版本和 torch 版本与 ComfyUI 完全一致**（都是 3.11 / 2.12.0+cu130）。
+uv 的缓存按「包+版本+Python ABI」索引，版本对齐后整个安装过程**零下载**（实测 3 秒）。
+
+```bash
+cd ~/Desktop/egoexo-fitness-aqa
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+
+uv venv .venv --python 3.11
+
+# torch 必须显式给 pytorch 的 cu130 源，否则会从默认源解析成别的 CUDA build
+uv pip install --python .venv/bin/python \
+  --index-url https://download.pytorch.org/whl/cu130 \
+  --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
+  "torch==2.12.0" "torchvision==0.27.0"
+
+uv pip install --python .venv/bin/python \
+  "numpy==2.4.6" "scipy==1.17.1" "transformers==5.9.0" "huggingface-hub==1.17.0"
+
+# --no-deps：我们自己的包是纯 Python，不需要动上面任何一个依赖
+uv pip install --python .venv/bin/python --no-deps -e .
+```
+
+> 版本号从 ComfyUI 的 venv 里读出来对齐就行：
+> `uv pip list --python /home/doit/.venv/comfyui/bin/python | grep -E "^(torch|numpy|scipy|transformers)"`
+>
+> ⚠️ uv 的 `--offline` **不能**用来复用缓存：离线时它连索引元数据都读不到，会直接报
+> `torch was not found in the cache`。必须联网解析一次，uv 才会去复用缓存的 wheel 归档。
+
+### 3. hf-mirror + 凭证
+
+huggingface.co 在国内不可达，而 `huggingface_hub` 只认 `HF_ENDPOINT` 环境变量。
+代码里已把这件事做掉（`secrets.apply_hf_endpoint()`），在**任何** HF 调用之前生效
+—— 否则报的是 DNS/连接超时这类误导性错误，很难定位到「其实是镜像没设」。
+
+```bash
+umask 077
+cat > ~/.hf_env <<'EOF'
+export HUGGINFACE_ACCESS_KEY_COLAB_CLI=hf_xxxx
+export HF_ENDPOINT=https://hf-mirror.com
+EOF
+chmod 600 ~/.hf_env
+```
+
+`secrets.py` 的取值顺序：**Colab Secret → `~/.hf_env` → 环境变量**。
+`~/.hf_env` 强制 `0600`，权限不对直接拒读（一个全局可读的凭证文件等于没设防）。
+
+### 4. bf16
+
+T4（Turing, sm75）不支持 bf16，所以最早的代码写死 fp16 + GradScaler。
+3080 是 Ampere，**bf16 更合适**：指数位与 fp32 相同 → 不会梯度下溢 → **不需要 GradScaler**，
+也不用调 loss scale。代码现在自动判断：
+
+```bash
+--amp-dtype auto   # 默认。支持 bf16 就用 bf16，否则 fp16
+```
+
+每个 fold 开头会打印实际用的 dtype，避免「以为在用 bf16」：
+
+```
+[fold 0] amp=True dtype=torch.bfloat16 scaler=False device=cuda
+```
+
+### 5. 并行扫参
+
+实测这个任务 **GPU 利用率只有 15%**（模型 <5M 参数，输入是预抽取好的 176MB 特征矩阵，
+瓶颈在 Python/DataLoader，不在算力）。20GB 显存跑 8 个配置绰绰有余。
+
+`--fold N --folds 5` 支持只跑第 N 折，所以可以把不同配置的**同一折**并行跑，
+验证集完全相同，结果可直接横比：
+
+```bash
+for name in base no_worst crop10 f64 big debias noalign bigbatch; do
+  python -m egoexo.cli train --out runs/par/$name \
+    --folds 5 --fold 0 --epochs 40 --amp-dtype bf16 --num-workers 3 &
+done
+wait
+```
+
+---
+
 ## 8. 引用
 
 ```bibtex
