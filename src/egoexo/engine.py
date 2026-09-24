@@ -343,6 +343,10 @@ def train_fold(
         return infonce_alignment(z, uids, batch["is_ego"].to(device))
 
     best = {"score": -float("inf"), "state": None, "epoch": -1}
+    # 关键点单独记峰值。两个任务的最优停机点不重合：KP F1 在 epoch 4-8 见顶后下滑，
+    # SROCC 到 epoch 40+ 还在涨，混用同一个 best 会互相掩盖。
+    best_kp = {"score": -float("inf"), "f1": float("nan"), "f1_best": float("nan"),
+               "state": None, "epoch": -1, "srocc": float("nan")}
     history = []
     t0 = time.time()
 
