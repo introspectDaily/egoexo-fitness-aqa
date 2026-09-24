@@ -39,6 +39,7 @@ class TrainConfig:
     score_noise: float = 0.15
     focal_gamma: float = 0.0
     ema_decay: float = 0.0  # >0 时启用 EMA 权重
+    eval_train: bool = True  # 每 epoch 额外算训练集指标，用于诊断过拟合/欠拟合
     seed: int = 0
     num_workers: int = 2
     device: str = "cuda"
@@ -200,6 +201,10 @@ def train_fold(
         augment=True, temporal_jitter=cfg.temporal_jitter, feat_dropout=cfg.feat_dropout, score_noise=cfg.score_noise,
     )
     val_ds = AqaDataset(samples, features, bundle, split.val_idx, augment=False)
+    # 训练集侧的无增强副本：用来区分「过拟合」和「欠拟合」。
+    # 只看验证集的话，SROCC=0.15 既可能是模型把训练集背下来了但对新人不泛化，
+    # 也可能是两边都没学会。加上 train 指标一眼就能分开。
+    train_eval_ds = AqaDataset(samples, features, bundle, split.train_idx, augment=False) if cfg.eval_train else None
 
     train_ld = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
@@ -208,6 +213,14 @@ def train_fold(
     val_ld = DataLoader(
         val_ds, batch_size=cfg.batch_size * 2, shuffle=False, num_workers=cfg.num_workers,
         collate_fn=collate, pin_memory=True, persistent_workers=cfg.num_workers > 0,
+    )
+    train_eval_ld = (
+        DataLoader(
+            train_eval_ds, batch_size=cfg.batch_size * 2, shuffle=False, num_workers=cfg.num_workers,
+            collate_fn=collate, pin_memory=True, persistent_workers=cfg.num_workers > 0,
+        )
+        if train_eval_ds is not None
+        else None
     )
 
     model = AqaModel(
@@ -277,7 +290,7 @@ def train_fold(
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(opt)
             scaler.update()
-            sched.step()
+            sched.step()  # 必须在 optimizer.step() 之后，否则 torch 会跳过 lr 调度的第一个值
             if ema is not None:
                 ema.update(model)
 
@@ -297,9 +310,23 @@ def train_fold(
             ema.restore(model)
         s = summarize(res)
 
-        history.append({"epoch": epoch, **{f"train_{k}": v for k, v in avg.items()}, **s})
+        # 训练集侧指标（可选）：诊断过拟合 vs 欠拟合
+        tr = None
+        if train_eval_ld is not None:
+            if ema is not None:
+                ema.apply_to(model)
+            res_tr = evaluate(model, train_eval_ld, samples, split.train_idx, device, use_amp)
+            if ema is not None:
+                ema.restore(model)
+            tr = summarize(res_tr)
+
+        history.append({"epoch": epoch, **{f"train_{k}": v for k, v in avg.items()}, **s,
+                        **({"tr_srocc": tr["srocc"], "tr_mae": tr["mae"], "tr_kp_f1": tr["kp_f1"]} if tr else {})})
+        extra = f" | train SROCC={tr['srocc']:.4f} MAE={tr['mae']:.4f} KP F1={tr['kp_f1']:.4f}" if tr else ""
         log(f"[fold {split.fold}] ep {epoch + 1:3d}/{cfg.epochs} loss={avg.get('total', float('nan')):.4f} "
-            f"| val SROCC={s['srocc']:.4f} MAE={s['mae']:.4f} | KP F1={s['kp_f1']:.4f} (best {s['kp_f1_best']:.4f})")
+            f"(score={avg.get('score', float('nan')):.3f} kp={avg.get('keypoint', float('nan')):.3f} "
+            f"act={avg.get('action', float('nan')):.3f} align={avg.get('align', float('nan')):.3f}) "
+            f"| val SROCC={s['srocc']:.4f} MAE={s['mae']:.4f} KP F1={s['kp_f1']:.4f} (best {s['kp_f1_best']:.4f}){extra}")
 
         # 用 SROCC 早停（AQA 领域主指标），而不是 loss。
         # 少数情况下 SROCC 会是 NaN —— :func:`metrics._safe_spearman` 在预测接近常数时
