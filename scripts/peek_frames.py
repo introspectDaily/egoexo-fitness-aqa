@@ -107,33 +107,103 @@ def endpoint() -> str:
     return (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
 
 
-def open_stream(path_in_repo: str, token: str | None, budget_mb: int, what: str):
-    import requests
+class _IterReader(io.RawIOBase):
+    """把「分块迭代」的 HTTP 响应体包成 tarfile 能用的 read(n)。"""
 
+    def __init__(self, it):
+        self._it = it
+        self._buf = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            out = self._buf + b"".join(self._it)
+            self._buf = b""
+            return out
+        while len(self._buf) < size:
+            try:
+                self._buf += next(self._it)
+            except StopIteration:
+                break
+        out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def readinto(self, b):
+        d = self.read(len(b))
+        b[: len(d)] = d
+        return len(d)
+
+
+def _http_get(url: str, headers: dict, timeout: float = 120.0):
+    """返回 (status, headers, body_reader, close)。
+
+    优先用 **httpx**：huggingface_hub 1.x 自带它，而 1.x 已经不再依赖 requests
+    （所以一个按官方 requirements 装好的环境里往往根本没有 requests）。
+    没有 httpx 就退回 requests（Colab 的 hf_hub 0.x 环境）。两条路都不需要额外安装。
+    """
+    try:
+        import httpx  # hf_hub >=1.0 的依赖
+
+        client = httpx.Client(follow_redirects=True, timeout=timeout)
+        req = client.build_request("GET", url, headers=headers)
+        resp = client.send(req, stream=True)
+
+        def close():
+            resp.close()
+            client.close()
+
+        return resp.status_code, resp.headers, _IterReader(resp.iter_bytes()), close
+    except ImportError:
+        import requests
+
+        r = requests.get(url, headers=headers, stream=True, timeout=timeout)
+
+        def close():
+            r.close()
+
+        return r.status_code, r.headers, _IterReader(r.iter_content(65536)), close
+
+
+def open_stream(path_in_repo: str, token: str | None, budget_mb: int, what: str):
     url = f"{endpoint()}/datasets/{REPO_ID}/resolve/main/{path_in_repo}"
     headers = {"Accept-Encoding": "identity"}  # 关键：别让 CDN 对 .gz 再套一层 gzip
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    r = requests.get(url, headers=headers, stream=True, timeout=120)
-    if r.status_code in (401, 403):
+    status, hdrs, body, close = _http_get(url, headers)
+    if status in (401, 403):
+        close()
         raise SystemExit(
-            f"\n[peek] {what} 拿不到（HTTP {r.status_code}）。排查顺序：\n"
-            f"  1. 登录账号 == 在 https://huggingface.co/datasets/{REPO_ID} 点过 Agree 的账号\n"
+            f"\n[peek] {what} 拿不到（HTTP {status}）。排查顺序：\n"
+            f"  1. 登录账号 == 在 {endpoint()}/datasets/{REPO_ID} 点过 Agree 的账号\n"
             f"  2. Fine-grained token 要额外勾上\n"
             f"     'Read access to contents of all public GATED repos you can access'\n"
-            f"  3. Colab Secret 改名/勾 Notebook access 后**必须重启 runtime** 才生效\n"
+            f"  3. token 要能被 huggingface_hub.get_token() 读到\n"
+            f"     （默认位置 ~/.cache/huggingface/token，或设 HF_TOKEN）\n"
+            f"  4. 失败时先手动验一条：\n"
+            f"     curl -sIL -H \"Authorization: Bearer $TOKEN\" \n"
+            f"       {endpoint()}/datasets/{REPO_ID}/resolve/main/raw_annotations/meta_records.json\n"
         )
-    r.raise_for_status()
-    enc = (r.headers.get("Content-Encoding") or "identity").strip().lower()
+    if status >= 400:
+        close()
+        raise SystemExit(f"[peek] {what} HTTP {status}")
+    enc = (str(hdrs.get("Content-Encoding") or "identity")).strip().lower()
     if enc not in ("", "identity"):
+        close()
         raise SystemExit(
-            f"[peek] 服务器返回 Content-Encoding: {enc}，urllib3 会先解一层，"
+            f"[peek] 服务器返回 Content-Encoding: {enc}，中间层会先解一层，"
             f"tarfile 收到已解压字节会报错。"
         )
-    total = r.headers.get("Content-Length")
+    total = hdrs.get("Content-Length")
     extra = f"（该分片 {int(total) / 1e6:.0f}MB，但只按需读）" if total else ""
     print(f"[peek] {what}: 流式打开成功{extra}")
-    return BudgetReader(r.raw, budget_mb * 1024 * 1024), r
+
+    class _Resp:
+        def close(self):
+            close()
+
+    return BudgetReader(body, budget_mb * 1024 * 1024), _Resp()
 
 
 # ---------------------------------------------------------------- 目标帧解析
@@ -365,12 +435,18 @@ def render(rid, got, views, out_dir: Path, rotate: bool):
                 continue
             data = got[f][v]
             p = out_dir / f"{v}_frame_{f:010d}.jpg"
-            if not p.exists():
-                p.write_bytes(data)
-                saved.append(p)
             im = Image.open(io.BytesIO(data)).convert("RGB")
             if rotate:
+                # ⚠️ 必须写**旋转后**的像素，不能直接 write_bytes(data) ——
+                # 否则 rotated/ 目录里放的是原图，你对着它比半天也看不出差别。
                 im = im.rotate(OFFICIAL_ROTATE.get(v, 0), expand=True)
+                p = out_dir / f"{v}_frame_{f:010d}.jpg"
+                if not p.exists():
+                    im.save(p, quality=95)
+                    saved.append(p)
+            elif not p.exists():
+                p.write_bytes(data)
+                saved.append(p)
             row.append((f, im))
         if row:
             pil_rows.append((v, row))
