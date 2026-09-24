@@ -261,7 +261,7 @@ def cmd_train(args) -> None:
         temporal_jitter=args.temporal_jitter, feat_dropout=args.feat_dropout, score_noise=args.score_noise,
         focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=args.eval_train, use_worst_frame=not args.no_worst_frame,
         seed=args.seed, num_workers=args.num_workers,
-        amp=not args.no_amp,
+        amp=not args.no_amp, amp_dtype=args.amp_dtype,
         weights=LossWeights(score=args.w_score, keypoint=args.w_keypoint, action=args.w_action, align=args.w_align),
     )
 
@@ -363,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--num-workers", type=int, default=4)
     s.add_argument("--no-amp", action="store_true")
+    s.add_argument("--amp-dtype", default="auto", choices=["auto","bf16","fp16","fp32"],
+                   help="auto = 支持 bf16 就用 bf16(Ampere+)，否则 fp16(T4)")
     s.set_defaults(func=cmd_train)
 
     return p

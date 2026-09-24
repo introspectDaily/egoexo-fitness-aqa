@@ -45,10 +45,30 @@ class TrainConfig:
     num_workers: int = 4
     device: str = "cuda"
     amp: bool = True
+    # auto: 有 bf16 就用 bf16（Ampere+），否则 fp16（Turing/T4）。
+    # bf16 不需要 GradScaler，动态范围和 fp32 一致，混合精度下更稳。
+    amp_dtype: str = "auto"  # auto | bf16 | fp16 | fp32
     weights: LossWeights = field(default_factory=LossWeights)
 
 
 # ---------------------------------------------------------------- 工具
+
+
+_AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+def _resolve_amp_dtype(name: str, device: str) -> torch.dtype:
+    """把 amp_dtype 选项解析成 torch.dtype。
+
+    auto 的含义：能用 bf16 就用 bf16。T4（Turing, sm75）不支持 bf16，会退回 fp16；
+    RTX 30/40 系（Ampere+）用 bf16 —— 它不需要 GradScaler，动态范围等同 fp32，
+    混合精度训练更稳，不需要调 loss scale。
+    """
+    if name in _AMP_DTYPES:
+        return _AMP_DTYPES[name]
+    if device.startswith("cuda") and torch.cuda.is_available():
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
 
 
 def set_seed(seed: int) -> None:
@@ -113,7 +133,7 @@ def compute_pos_weight(samples, indices, clip: float = 20.0) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, samples, indices, device, amp: bool = True) -> dict:
+def evaluate(model, loader, samples, indices, device, amp: bool = True, amp_dtype_name: str = "auto") -> dict:
     model.eval()
     preds, targets, kp_logits, kp_labels, kp_masks, order, view_types = [], [], [], [], [], [], []
 
@@ -123,7 +143,7 @@ def evaluate(model, loader, samples, indices, device, amp: bool = True) -> dict:
         view_id = batch["view_id"].to(device, non_blocking=True)
         kp_mask = batch["kp_mask"].to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=amp and device.startswith("cuda")):
+        with torch.amp.autocast("cuda", dtype=_resolve_amp_dtype(amp_dtype_name, device), enabled=amp):
             out = model(feat, action_id, view_id, kp_mask)
 
         preds.append(out.score.float().cpu().numpy())
@@ -249,12 +269,15 @@ def train_fold(
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     use_amp = cfg.amp and device.startswith("cuda")
-    # T4 不支持 bf16，必须 fp16 + GradScaler。
+    amp_dtype = _resolve_amp_dtype(cfg.amp_dtype, device)
+    # 只有 fp16 需要 GradScaler 防梯度下溢；bf16 的指数位和 fp32 一样，不需要。
     # torch>=2.1 用 torch.amp.GradScaler("cuda")，老版本只有 torch.cuda.amp.GradScaler。
+    need_scaler = use_amp and amp_dtype == torch.float16
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=need_scaler)
     except (AttributeError, TypeError):  # pragma: no cover
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=need_scaler)
+    log(f"[fold {split.fold}] amp={use_amp} dtype={amp_dtype} scaler={need_scaler} device={device}")
     ema = EMA(model, cfg.ema_decay) if cfg.ema_decay > 0 else None
 
     # 全局动作 uid 表：把「同一物理动作的不同视角」映射到同一 uid，供 InfoNCE 用。
@@ -282,7 +305,7 @@ def train_fold(
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 out = model(feat, action_id, view_id, kp_mask)
                 loss, parts = total_loss(out, batch, cfg.weights, pos_weight, cfg.focal_gamma, align_fn)
 
@@ -306,7 +329,7 @@ def train_fold(
         # 评估用的是 EMA 权重，所以「最优权重」必须从当下这刻抓，否则会存下未 EMA 的版本，
         # 结果就是：选 epoch 用的是一套权重，最后报告的是另一套。
         state_now = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        res = evaluate(model, val_ld, samples, split.val_idx, device, use_amp)
+        res = evaluate(model, val_ld, samples, split.val_idx, device, use_amp, cfg.amp_dtype)
         if ema is not None:
             ema.restore(model)
         s = summarize(res)
@@ -316,7 +339,7 @@ def train_fold(
         if train_eval_ld is not None:
             if ema is not None:
                 ema.apply_to(model)
-            res_tr = evaluate(model, train_eval_ld, samples, split.train_idx, device, use_amp)
+            res_tr = evaluate(model, train_eval_ld, samples, split.train_idx, device, use_amp, cfg.amp_dtype)
             if ema is not None:
                 ema.restore(model)
             tr = summarize(res_tr)
@@ -340,7 +363,7 @@ def train_fold(
             best = {"score": crit, "state": state_now, "epoch": epoch}
 
     model.load_state_dict(best["state"])
-    final = evaluate(model, val_ld, samples, split.val_idx, device, use_amp)
+    final = evaluate(model, val_ld, samples, split.val_idx, device, use_amp, cfg.amp_dtype)
 
     torch.save(
         {"state_dict": best["state"], "config": asdict(cfg), "bundle": bundle.save_meta(), "epoch": best["epoch"]},
