@@ -261,6 +261,7 @@ def cmd_train(args) -> None:
         temporal_jitter=args.temporal_jitter, feat_dropout=args.feat_dropout, score_noise=args.score_noise,
         focal_gamma=args.focal_gamma, ema_decay=args.ema_decay, eval_train=args.eval_train, use_worst_frame=not args.no_worst_frame,
         kp_grad_scale=args.kp_grad_scale, use_kp_feats=not args.no_score_kp,
+        select_metric=args.select_metric,
         seed=args.seed, num_workers=args.num_workers,
         amp=not args.no_amp, amp_dtype=args.amp_dtype,
         weights=LossWeights(score=args.w_score, keypoint=args.w_keypoint, action=args.w_action, align=args.w_align),
@@ -357,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--w-keypoint", type=float, default=1.0)
     s.add_argument("--w-action", type=float, default=0.3)
     s.add_argument("--w-align", type=float, default=0.7, help="跨视角 InfoNCE 权重，论文用 0.7")
+    s.add_argument("--select-metric", choices=["srocc", "kp_f1"], default="srocc",
+                   help="选最优 epoch 的依据。实测两任务最优停机点不重合：KP F1 在 epoch 4-8 "
+                        "见顶后下滑，SROCC 要到 epoch 40+ 还在涨，按 SROCC 选会少报 KP F1")
     s.add_argument("--kp-grad-scale", type=float, default=1.0,
                    help="分数头->关键点头的梯度回流强度。1=全耦合(默认)，0=切断。"
                         "分数标签 alpha 只有 0.17，关键点标签一致率 0.83，"

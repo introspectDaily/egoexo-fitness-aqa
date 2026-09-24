@@ -60,11 +60,15 @@ CONFIGS: dict[str, list[str]] = {
     "decouple": ["--kp-grad-scale", "0.0"],
     "halfdecouple": ["--kp-grad-scale", "0.5"],
     "noscorekp": ["--no-score-kp"],  # 对照：分数头完全看不到关键点（会丢可解释性）
+    # --- 针对「KP F1 在 epoch 4-8 见顶后下滑、SROCC 要到 40+ 还在涨」这个错位 ---
+    "ep12": ["--epochs", "12"],
+    "selkp": ["--select-metric", "kp_f1"],
 }
 
 METRIC_KEYS = ["srocc", "plcc", "mae", "acc1", "kp_f1", "kp_f1_best",
                "srocc_ego", "srocc_exo", "kp_f1_ego", "kp_f1_exo",
-               "fused_srocc", "fused_kp_f1", "fused_kp_best"]
+               "fused_srocc", "fused_kp_f1", "fused_kp_best",
+               "kp_peak_f1", "kp_peak_f1_best", "kp_peak_epoch"]
 
 
 def collect(out: pathlib.Path) -> dict[str, dict]:
@@ -101,12 +105,15 @@ def report(out: pathlib.Path) -> None:
     if not agg:
         print("(没有已完成的结果)")
         return
-    hdr = ["kp_f1", "kp_f1_best", "srocc", "mae", "srocc_ego", "srocc_exo", "fused_kp_best", "spread", "n"]
+    hdr = ["kp_f1_best", "kp_peak_f1_best", "fused_kp_best", "kp_f1", "srocc",
+           "fused_srocc", "srocc_ego", "srocc_exo", "spread", "n"]
     print(f"{'config':<12}" + "".join(f"{h:>13}" for h in hdr))
     print("-" * (12 + 13 * len(hdr)))
     for c, m in sorted(agg.items(), key=lambda kv: -kv[1]["kp_f1_best"]):
-        vals = [m["kp_f1"], m["kp_f1_best"], m["srocc"], m["mae"], m["srocc_ego"], m["srocc_exo"],
-                m.get("fused_kp_best", float("nan")), m["kp_f1_spread"], m["n_folds"]]
+        vals = [m["kp_f1_best"], m.get("kp_peak_f1_best", float("nan")),
+                m.get("fused_kp_best", float("nan")), m["kp_f1"], m["srocc"],
+                m.get("fused_srocc", float("nan")), m["srocc_ego"], m["srocc_exo"],
+                m["kp_f1_spread"], m["n_folds"]]
         print(f"{c:<12}" + "".join(f"{v:>13.4f}" if isinstance(v, float) else f"{v:>13}" for v in vals))
     print()
     print("对照：论文 GEVFormer 0.5439 | 论文 CLIP-GEV 朴素基线 0.4881 | Random 0.3178 | 多数类 0.3265")

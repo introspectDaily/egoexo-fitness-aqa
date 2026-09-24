@@ -44,6 +44,10 @@ class TrainConfig:
     # 关键点标签一致率 0.83，让前者改后者表征是在用脏水洗衣服。
     kp_grad_scale: float = 1.0
     use_kp_feats: bool = True  # 分数头是否消费关键点统计量（关掉=纯视觉回归）
+    # 选最优 epoch 的依据。实测两任务的最优停机点**不重合**：
+    # base fold0 的 KP F1 在 epoch 4 见顶(0.5559)后一路下滑到 epoch 43 的 0.5094，
+    # 而 SROCC 到 epoch 43 还在涨。所以按 SROCC 选权重会系统性少报 KP F1。
+    select_metric: str = "srocc"  # srocc | kp_f1
     eval_train: bool = False  # 每 epoch 额外算训练集指标，用于诊断过拟合/欠拟合
     seed: int = 0
     num_workers: int = 4
@@ -405,17 +409,23 @@ def train_fold(
         # 少数情况下 SROCC 会是 NaN —— :func:`metrics._safe_spearman` 在预测接近常数时
         # 主动返回 NaN（此时秩相关无定义）。这时退回 -MAE，否则 best 会永远停在初始值，
         # 最后 load_state_dict(None) 直接崩。
-        crit = s["srocc"]
+        crit = s["srocc"] if cfg.select_metric == "srocc" else s["kp_f1_best"]
         if np.isnan(crit):
             crit = -s["mae"]
         if crit > best["score"]:
             best = {"score": crit, "state": state_now, "epoch": epoch}
 
-    model.load_state_dict(best["state"])
+        kpc = s["kp_f1_best"]
+        if not np.isnan(kpc) and kpc > best_kp["score"]:
+            best_kp = {"score": kpc, "f1": s["kp_f1"], "f1_best": kpc, "state": state_now,
+                       "epoch": epoch, "srocc": s["srocc"]}
+
+    chosen = best_kp if (cfg.select_metric == "kp_f1" and best_kp["state"] is not None) else best
+    model.load_state_dict(chosen["state"])
     final = evaluate(model, val_ld, samples, split.val_idx, device, use_amp, cfg.amp_dtype)
 
     torch.save(
-        {"state_dict": best["state"], "config": asdict(cfg), "bundle": bundle.save_meta(), "epoch": best["epoch"]},
+        {"state_dict": chosen["state"], "config": asdict(cfg), "bundle": bundle.save_meta(), "epoch": chosen["epoch"]},
         out_dir / f"fold{split.fold}_best.pt",
     )
     with open(out_dir / f"fold{split.fold}_history.json", "w", encoding="utf-8") as f:
@@ -428,6 +438,14 @@ def train_fold(
 
     summary = summarize(final)
     summary["best_epoch"] = best["epoch"]
+    summary["select_metric"] = cfg.select_metric
+    # 峰值口径。⚠️ 这是在验证集上挑 epoch 又报验证集，属于选择性偏差，会偏乐观；
+    # 和已有的 best-threshold 是同一类问题。报它是为了暴露「按 SROCC 选权重会少报
+    # 多少」，不是为了当作可对标论文的数字。
+    summary["kp_peak_epoch"] = best_kp["epoch"]
+    summary["kp_peak_f1"] = best_kp["f1"]
+    summary["kp_peak_f1_best"] = best_kp["f1_best"]
+    summary["kp_peak_srocc"] = best_kp["srocc"]
     summary["minutes"] = (time.time() - t0) / 60
     with open(out_dir / f"fold{split.fold}_summary.json", "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "per_action": final["per_action"],
