@@ -263,7 +263,11 @@ def cmd_train(args) -> None:
 
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
-    (out_root / "config.json").write_text(json.dumps(vars(args), indent=1, ensure_ascii=False), encoding="utf-8")
+    (out_root / "config.json").write_text(
+        # vars(args) 里含 argparse 塞进去的 func 回调，不是 JSON 可序列化的
+        json.dumps({k: v for k, v in vars(args).items() if not callable(v)}, indent=1, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     results = []
     for fold in folds:
