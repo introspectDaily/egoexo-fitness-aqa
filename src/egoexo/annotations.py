@@ -95,6 +95,8 @@ class Action:
     comments: list[str | None]
     # [标注者][关键点位置] -> 0/1，原始未聚合的验证结果（算 α 用）
     per_annotator: list[list[int]] = field(default_factory=list)
+    # 去偏后的每位标注者分数（apply_annotator_debias 填充）；None 表示不去偏
+    debiased: list[float] | None = None
 
     @property
     def key(self) -> str:
@@ -103,6 +105,8 @@ class Action:
     @property
     def score(self) -> float:
         """标注者平均分。≥2 位标注者时是软标签，直接当回归目标会引入噪声。"""
+        if self.debiased is not None:
+            return sum(self.debiased) / len(self.debiased)
         return sum(self.scores) / len(self.scores)
 
     @property
@@ -164,6 +168,7 @@ class Dataset:
     actions: dict[str, Action]
     samples: list[Sample]
     action_names: list[str] = field(default_factory=list)
+    debias_info: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.action_names:
@@ -241,12 +246,15 @@ def load_actions(raw_dir: Path, records: dict[str, Record]) -> dict[str, Action]
         # 关键点文本以第一位标注者为准（文本一致，只是 True/False 不同）
         kp_texts = [t for t, _ in anns[0]["key_point_verification"]]
         # 逐标注者收集其验证结果，长度不足时截断对齐
+        # 存 int 而不是 bool：后面要拿它当下标建重合矩阵，而 numpy 里 `m[True, False]`
+        # 是**布尔掩码索引**（会插新轴），不是取 (1,0) 元素 —— 静默算错。
         per_ann_kp = []
         for a in anns:
             kv = a["key_point_verification"]
-            per_ann_kp.append([_parse_bool(v) for _, v in kv[: len(kp_texts)]])
+            per_ann_kp.append([int(_parse_bool(v)) for _, v in kv[: len(kp_texts)]])
 
         # 用多数表决合成每个关键点的结论
+        # 多数表决也基于 int，避免 True/False 混用
         keypoints: list[Keypoint] = []
         for i, text in enumerate(kp_texts):
             votes = [pk[i] for pk in per_ann_kp if i < len(pk)]
@@ -276,10 +284,26 @@ def load_actions(raw_dir: Path, records: dict[str, Record]) -> dict[str, Action]
     return out
 
 
-def load_dataset(raw_dir: str | Path) -> Dataset:
+def load_dataset(raw_dir: str | Path, debias_scores: bool = False, debias_min_n: int = 30) -> Dataset:
+    """加载数据集。
+
+    debias_scores=True 时，先把每位标注者的分数减去其个人均值再加回全局均值。
+
+    为什么需要这个：实测 26 位标注者的个人平均分从 **2.57 到 4.06**，跨度 1.5 分，
+    且同一 record 内各标注者的宽严排序跨 record 一致（不是他们看了不同的动作，
+    是真的个人尺度不同）。所以“标注者平均分”这个目标本身含一个系统偏移。
+    去偏后逐对完全相等率 31%→41%，平均绝对差 0.90→0.73。
+
+    debias_min_n 用来过滤标注量太少的标注者：他们的个人均值本身噪声巨大，
+    减它只会引入更多噪声。不足 debias_min_n 条的标注者不去偏。
+    """
     raw_dir = Path(raw_dir)
     records = load_records(raw_dir)
     actions = load_actions(raw_dir, records)
+
+    debias_info: dict = {}
+    if debias_scores:
+        actions, debias_info = apply_annotator_debias(actions, min_n=debias_min_n)
 
     samples: list[Sample] = []
     for act in actions.values():
@@ -310,7 +334,60 @@ def load_dataset(raw_dir: str | Path) -> Dataset:
             )
 
     samples.sort(key=lambda s: (s.record_id, s.action_idx, VIEW_ORDER.index(s.view)))
-    return Dataset(records=records, actions=actions, samples=samples)
+    ds = Dataset(records=records, actions=actions, samples=samples)
+    ds.debias_info = debias_info
+    return ds
+
+
+# ---------------------------------------------------------------- 标注者偏差校正
+
+
+def annotator_bias_table(actions: dict[str, Action], min_n: int = 30) -> dict[str, dict]:
+    """每位标注者的平均分、标准差、标注量。用来判断存不存在系统性宽/严。"""
+    import statistics
+
+    buckets: dict[str, list[int]] = {}
+    for a in actions.values():
+        for ann, s in zip(a.annotators, a.scores):
+            buckets.setdefault(ann, []).append(s)
+
+    table = {}
+    for ann, vals in buckets.items():
+        table[ann] = {
+            "n": len(vals),
+            "mean": statistics.mean(vals),
+            "std": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+            "used": len(vals) >= min_n,
+        }
+    return table
+
+
+def apply_annotator_debias(actions: dict[str, Action], min_n: int = 30) -> tuple[dict[str, Action], dict]:
+    """每人减去自己的均值，再加回全局均值。返回新 actions 与统计信息。"""
+    import statistics
+
+    table = annotator_bias_table(actions, min_n=min_n)
+    all_scores = [s for a in actions.values() for s in a.scores]
+    grand = statistics.mean(all_scores)
+
+    offset = {ann: info["mean"] - grand for ann, info in table.items() if info["used"]}
+
+    for act in actions.values():
+        raw = act.scores
+        # 逐标注者减去其个人偏移；未参与去偏的标注者（样本太少）保留原分
+        corrected = [s - offset.get(ann, 0.0) for ann, s in zip(act.annotators, raw)]
+        act.debiased = corrected
+
+    used_means = [table[a]["mean"] for a in offset]
+    return actions, {
+        "grand_mean": grand,
+        "min_n": min_n,
+        "n_annotators_total": len(table),
+        "n_annotators_used": len(offset),
+        "mean_range": [min(used_means), max(used_means)] if used_means else None,
+        "offsets": offset,
+        "table": table,
+    }
 
 
 # ---------------------------------------------------------------- 关键点词表

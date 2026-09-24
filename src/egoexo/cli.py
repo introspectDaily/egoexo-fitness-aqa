@@ -24,7 +24,7 @@ def cmd_stats(args) -> None:
     import statistics
 
     from .annotations import action_subsets, build_keypoint_vocab, load_dataset
-    from .metrics import krippendorff_alpha_nominal, krippendorff_alpha_ordinal
+    from .metrics import agreement_diagnostics, krippendorff_alpha_nominal, krippendorff_alpha_ordinal
 
     ds = load_dataset(args.raw_dir)
     vocab = build_keypoint_vocab(ds)
@@ -61,10 +61,10 @@ def cmd_stats(args) -> None:
         print(f"  {name}: {len(kps)} 条")
 
     # 标注者间一致性：这份 release 里几乎没人做，做了就是加分项
-    print("\n-- 标注者间一致性 (Krippendorff's α) --")
+    print("\n-- 标注者间一致性 --")
     score_units = [a.scores for a in ds.actions.values()]
     alpha_s = krippendorff_alpha_ordinal(score_units, max_value=5)
-    print(f"  分数(有序): α = {alpha_s:.4f}   [n={sum(1 for u in score_units if len(u) >= 2)} 个多标注动作]")
+    print(f"  分数(有序) Krippendorff's α = {alpha_s:.4f}   [n={sum(1 for u in score_units if len(u) >= 2)} 个多标注动作]")
 
     # 逐关键点位置收集各标注者的 0/1。必须用**未聚合**的原始值：
     # 用多数表决后的 keypoints 会让 α 恒等于 1，等于什么都没测。
@@ -72,8 +72,31 @@ def cmd_stats(args) -> None:
     for a in ds.actions.values():
         kp_units.extend(a.keypoints_per_annotator)
     alpha_k = krippendorff_alpha_nominal(kp_units, max_value=1)
-    print(f"  关键点(名义): α = {alpha_k:.4f}   [n={len(kp_units)} 个关键点位置]")
-    print("  ⚠️  α<0.6 说明标注规范本身有争议，先修标注再调模型。")
+    print(f"  关键点(名义) Krippendorff's α = {alpha_k:.4f}   [n={len(kp_units)} 个关键点位置]")
+
+    diag = agreement_diagnostics(score_units)
+    from .annotations import annotator_bias_table
+
+    bias = annotator_bias_table(ds.actions)
+    used = {k: v for k, v in bias.items() if v["used"]}
+    print(f"\n  标注者个人均值（共 {len(bias)} 人，{len(used)} 人标注量 >=30）:")
+    if used:
+        lo = min(v["mean"] for v in used.values())
+        hi = max(v["mean"] for v in used.values())
+        print(f"    区间 {lo:.3f} ~ {hi:.3f}  (跨度 {hi-lo:.3f} 分 / 满分 5 分)")
+        for k, v in sorted(used.items(), key=lambda kv: -kv[1]["mean"]):
+            print(f"      {k:<14} n={v['n']:>4}  mean={v['mean']:.3f}  std={v['std']:.3f}")
+    print(f"\n  分数分歧诊断 [n={diag['n_pairs']} 对]:")
+    print(f"    完全相等      : {diag['exact']:.4f}")
+    print(f"    差距 ≤1 分    : {diag['within1']:.4f}")
+    print(f"    平均绝对差    : {diag['mean_abs']:.4f}")
+    print(f"    两位标注者间 Spearman: {diag['spearman']:.4f}   ← 独立于 α 的交叉校验")
+
+    if not np.isnan(alpha_s) and alpha_s < 0.6:
+        print("\n  ⚠️  α < 0.6：分数标注本身分歧很大。直接后果：")
+        print("      (a) SROCC 的上限被标注噪声压住，别指望 0.9；")
+        print("      (b) 训练必须当软标签处理（本仓库默认 --score-noise 0.15）；")
+        print("      (c) 报结果时应同时报这个 α，否则数字无法被正确解读。")
 
     # 官方划分是否可用
     subs = action_subsets(args.raw_dir)
@@ -98,6 +121,8 @@ def cmd_stats(args) -> None:
                     "unsatisfies_rate": float(pos),
                     "krippendorff_alpha_score": alpha_s,
                     "krippendorff_alpha_keypoint": alpha_k,
+                    "score_agreement_diagnostics": diag,
+                    "annotator_bias": {k: v for k, v in ds.debias_info.get("table", {}).items()},
                 },
                 indent=1,
                 ensure_ascii=False,
@@ -210,7 +235,7 @@ def cmd_train(args) -> None:
     from .splits import assert_no_leakage, group_kfold, holdout
     from .text import build_kp_text_table
 
-    ds = load_dataset(args.raw_dir)
+    ds = load_dataset(args.raw_dir, debias_scores=getattr(args, "score_debias", False))
     vocab = build_keypoint_vocab(ds)
     samples = ds.samples
     if args.only_views:
@@ -318,6 +343,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--w-action", type=float, default=0.3)
     s.add_argument("--w-align", type=float, default=0.7, help="跨视角 InfoNCE 权重，论文用 0.7")
     s.add_argument("--only-views", default=None)
+    s.add_argument("--score-debias", action="store_true",
+                   help="按标注者个人均值去偏（实测逐对完全相等率 31%%->40%%）。"
+                        "标签在训练时现算，所以只在这里设就够了")
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--num-workers", type=int, default=2)
     s.add_argument("--no-amp", action="store_true")

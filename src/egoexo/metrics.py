@@ -111,7 +111,23 @@ def krippendorff_alpha_ordinal(units: list[list[int]], max_value: int = 5) -> fl
     用差异函数 d(c,k) = (Σ_{g=c..k} n_g - (n_c+n_k)/2)^2，即 ordinal metric。
     units = [[标注者1的分, 标注者2的分, ...], ...]，只统计 >=2 位标注者的动作。
     """
-    pairs = [u for u in units if len(u) >= 2]
+    return _krippendorff(units, max_value, ordinal=True)
+
+
+def krippendorff_alpha_nominal(units: list[list[int]], max_value: int = 1) -> float:
+    """名义尺度的 alpha（关键点 True/False 的一致性）。"""
+    return _krippendorff(units, max_value, ordinal=False)
+
+
+def _krippendorff(units, max_value: int, ordinal: bool) -> float:
+    """Krippendorff's alpha 的实际实现。
+
+    ⚠️ units 里的值会被强制转成 int。原因：如果传进来的是 bool，
+    `coincidence[a, b]` 会变成 **布尔掩码索引**（numpy 会插一个新轴返回副本），
+    而不是取 (1,0) 元素 —— 不报错、静默算错，最后表现为 alpha=nan。
+    这个坑真的踩过。
+    """
+    pairs = [[int(v) for v in u] for u in units if len(u) >= 2]
     if len(pairs) < 2:
         return float("nan")
 
@@ -130,36 +146,61 @@ def krippendorff_alpha_ordinal(units: list[list[int]], max_value: int = 5) -> fl
     if n == 0:
         return float("nan")
 
-    def delta(c: int, k: int) -> float:
-        lo, hi = min(c, k), max(c, k)
-        return float((sum(n_c[lo : hi + 1]) - (n_c[c] + n_c[k]) / 2.0) ** 2)
+    if ordinal:
+
+        def delta(c: int, k: int) -> float:
+            lo, hi = min(c, k), max(c, k)
+            return float((sum(n_c[lo : hi + 1]) - (n_c[c] + n_c[k]) / 2.0) ** 2)
+    else:
+
+        def delta(c: int, k: int) -> float:
+            return 0.0 if c == k else 1.0
 
     do = sum(coincidence[c, k] * delta(c, k) for c in values for k in values) / n
     de = sum(n_c[c] * n_c[k] * delta(c, k) for c in values for k in values) / (n * (n - 1))
-    if de == 0:
+    if de <= 0:
+        # 边际分布退化到单一取值，期望分歧为 0，alpha 无定义
         return float("nan")
     return float(1 - do / de)
 
 
-def krippendorff_alpha_nominal(units: list[list[int]], max_value: int = 1) -> float:
-    """名义尺度的 alpha（关键点 True/False 的一致性）。"""
-    pairs = [u for u in units if len(u) >= 2]
-    if len(pairs) < 2:
-        return float("nan")
-    coincidence = np.zeros((max_value + 1, max_value + 1), dtype=np.float64)
-    for u in pairs:
-        m = len(u)
-        for a in u:
-            for b in u:
-                if a == b:
-                    continue
-                coincidence[a, b] += 1.0 / (m - 1)
-    n_c = coincidence.sum(axis=1)
-    n = coincidence.sum()
-    if n == 0:
-        return float("nan")
-    do = (n - np.trace(coincidence)) / n
-    de = (n * n - (n_c**2).sum()) / (n * (n - 1))
-    if de == 0:
-        return float("nan")
-    return float(1 - do / de)
+# ---------------------------------------------------------------- 标注分歧诊断
+
+
+def agreement_diagnostics(score_units: list[list[int]]) -> dict[str, float]:
+    """比 alpha 更好读的一致性诊断。
+
+    alpha 低到 0.17 时，光看一个数字不容易判断是「真低」还是「算法错」。
+    同时报这几个直接可核验的量：
+      - exact    : 两两完全相等的比例
+      - within1  : 两两差距 <= 1 的比例
+      - mean_abs : 两两平均绝对差
+      - spearman : 只取恰好 2 位标注者的动作，把两人分数当成两列向量做秩相关
+                   （这是独立于 alpha 的交叉验证：如果 alpha≈0.17 而 spearman≈0.5，
+                    说明 alpha 算错了；两者都低才是标注本身真的不一致）
+    """
+    import itertools
+
+    diffs: list[int] = []
+    for u in score_units:
+        for a, b in itertools.combinations(u, 2):
+            diffs.append(abs(int(a) - int(b)))
+
+    pairs2 = [(int(u[0]), int(u[1])) for u in score_units if len(u) == 2]
+    spearman = float("nan")
+    if len(pairs2) >= 10:
+        x = np.array([p[0] for p in pairs2], dtype=np.float64)
+        y = np.array([p[1] for p in pairs2], dtype=np.float64)
+        spearman = _safe_spearman(x, y)
+
+    if not diffs:
+        return {"n_pairs": 0, "exact": float("nan"), "within1": float("nan"), "mean_abs": float("nan"), "spearman": spearman}
+
+    d = np.array(diffs, dtype=np.float64)
+    return {
+        "n_pairs": int(len(d)),
+        "exact": float((d == 0).mean()),
+        "within1": float((d <= 1).mean()),
+        "mean_abs": float(d.mean()),
+        "spearman": spearman,
+    }
