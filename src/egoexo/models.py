@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -196,16 +197,37 @@ class KeypointHead(nn.Module):
     key/value = 视觉时序 token
     -> 每条关键点得到一个 logit
 
-    这样 12 个动作、102 条关键点句子共享同一套参数，且对没见过的措辞有一定泛化。
+    两条证据通道，因为关键点分两类（Fitness-AQA 论文明确区分过）：
+      (a) 时序平均证据 —— cross-attention，适合“整个动作过程都偏”的动态错误
+          （膝盖内扣、膝盖前移）。
+      (b) 最差帧证据   —— 逐帧打分后做 logsumexp（可微版本的 max），
+          适合“某一帧姿势就错了”的静态错误（下蹲深度、腰椎、躯干角度）。
+          只有 (a) 的话，softmax 是加权平均，结构上就没法“挑出最差那一帧”。
+
+    两者相加作为最终 logit，让模型自己学哪条通道更可靠。
     """
 
-    def __init__(self, dim: int, text_dim: int = 512, heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        text_dim: int = 512,
+        heads: int = 4,
+        dropout: float = 0.1,
+        use_worst_frame: bool = True,
+    ):
         super().__init__()
         self.text_proj = nn.Sequential(nn.LayerNorm(text_dim), nn.Linear(text_dim, dim))
         self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
         self.out = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 1))
+
+        self.use_worst_frame = use_worst_frame
+        if use_worst_frame:
+            # 给每一帧打一个“与关键点无关的”基础分，让模型能学到某些帧本来就更关键
+            self.frame_score = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 1))
+            self.worst_scale = nn.Parameter(torch.tensor(0.5))
+        self.dim = dim
 
     def forward(
         self,
@@ -225,6 +247,20 @@ class KeypointHead(nn.Module):
         )
         h = self.norm(q + self.drop(ctx))
         logits = self.out(h).squeeze(-1)  # (B, N)
+
+        if self.use_worst_frame:
+            # 与每帧的相似度 (B,N,T) + 每帧基础分 (B,1,T)
+            sim = torch.bmm(h, visual.transpose(1, 2)) / (self.dim**0.5)
+            base = self.frame_score(visual).transpose(1, 2)  # (B,1,T)
+            s = sim + base
+            if visual_mask is not None:
+                s = s.masked_fill(~visual_mask[:, None, :], float("-inf"))
+                # logsumexp 是 max 的光滑版（梯度更好）；减去 log(T) 避免它随帧数漂移
+                worst = torch.logsumexp(s, dim=-1) - torch.log(visual_mask.sum(-1, keepdim=True).clamp(min=1))
+            else:
+                worst = torch.logsumexp(s, dim=-1) - float(np.log(s.size(-1)))
+            logits = logits + self.worst_scale * worst
+
         return logits.masked_fill(kp_mask <= 0, 0.0)
 
 
